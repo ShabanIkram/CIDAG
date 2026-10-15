@@ -1,0 +1,111 @@
+{
+  "account_id": "123456789012",
+  "region": "us-east-1",
+  "identities": [
+    {
+      "type": "user",
+      "name": "ci-deployer",
+      "arn": "arn:aws:iam::123456789012:user/ci-deployer",
+      "attached_policies": ["arn:aws:iam::123456789012:policy/CIDeployerPolicy"]
+    },
+    {
+      "type": "user",
+      "name": "readonly-auditor",
+      "arn": "arn:aws:iam::123456789012:user/readonly-auditor",
+      "attached_policies": ["arn:aws:iam::123456789012:policy/ReadOnlyAccess"]
+    },
+    {
+      "type": "role",
+      "name": "lambda-exec-role",
+      "arn": "arn:aws:iam::123456789012:role/lambda-exec-role",
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {"Service": "lambda.amazonaws.com"},
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      },
+      "attached_policies": ["arn:aws:iam::123456789012:policy/LambdaExecPolicy"]
+    },
+    {
+      "type": "role",
+      "name": "admin-role",
+      "arn": "arn:aws:iam::123456789012:role/admin-role",
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:role/lambda-exec-role"},
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      },
+      "attached_policies": ["arn:aws:iam::123456789012:policy/AdminPolicy"]
+    }
+  ],
+  "policies": [
+    {
+      "arn": "arn:aws:iam::123456789012:policy/CIDeployerPolicy",
+      "name": "CIDeployerPolicy",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": ["s3:PutObject", "s3:GetObject"],
+          "Resource": "arn:aws:s3:::ci-artifacts/*"
+        },
+        {
+          "Effect": "Allow",
+          "Action": ["lambda:UpdateFunctionCode"],
+          "Resource": "arn:aws:lambda:us-east-1:123456789012:function:*"
+        },
+        {
+          "Effect": "Allow",
+          "Action": ["iam:PassRole"],
+          "Resource": "arn:aws:iam::123456789012:role/admin-role"
+        }
+      ]
+    },
+    {
+      "arn": "arn:aws:iam::123456789012:policy/ReadOnlyAccess",
+      "name": "ReadOnlyAccess",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": ["s3:Get*", "ec2:Describe*", "iam:Get*"],
+          "Resource": "*"
+        }
+      ]
+    },
+    {
+      "arn": "arn:aws:iam::123456789012:policy/LambdaExecPolicy",
+      "name": "LambdaExecPolicy",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+          "Resource": "*"
+        }
+      ]
+    },
+    {
+      "arn": "arn:aws:iam::123456789012:policy/AdminPolicy",
+      "name": "AdminPolicy",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": "*",
+          "Resource": "*"
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {"type": "s3", "name": "ci-artifacts", "arn": "arn:aws:s3:::ci-artifacts"},
+    {"type": "s3", "name": "prod-secrets", "arn": "arn:aws:s3:::prod-secrets"},
+    {"type": "lambda", "name": "image-resizer", "arn": "arn:aws:lambda:us-east-1:123456789012:function:image-resizer"}
+  ]
+}
