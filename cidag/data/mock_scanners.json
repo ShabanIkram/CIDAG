@@ -1,0 +1,87 @@
+{
+  "account_id": "123456789012",
+  "region": "us-east-1",
+  "account_public_access_block": {
+    "block_public_acls": true,
+    "ignore_public_acls": true,
+    "block_public_policy": false,
+    "restrict_public_buckets": false
+  },
+  "s3_buckets": [
+    {
+      "name": "acme-public-assets",
+      "arn": "arn:aws:s3:::acme-public-assets",
+      "region": "us-east-1",
+      "acl_grants": [
+        {"grantee_type": "Group", "grantee": "http://acs.amazonaws.com/groups/global/AllUsers", "permission": "READ"}
+      ],
+      "policy": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:*", "Resource": "arn:aws:s3:::acme-public-assets/*"}]},
+      "policy_is_public": true,
+      "encryption": null,
+      "logging": null,
+      "versioning": {"status": "Suspended", "mfadelete": "Disabled"},
+      "public_access_block": {"block_public_acls": false, "ignore_public_acls": false, "block_public_policy": false, "restrict_public_buckets": false}
+    },
+    {
+      "name": "acme-private-data",
+      "arn": "arn:aws:s3:::acme-private-data",
+      "region": "us-east-1",
+      "acl_grants": [
+        {"grantee_type": "CanonicalUser", "grantee": "acct-owner", "permission": "FULL_CONTROL"}
+      ],
+      "policy": null,
+      "policy_is_public": false,
+      "encryption": {"sse_algorithm": "aws:kms", "kms_master_key_id": "arn:aws:kms:us-east-1:123456789012:key/abc"},
+      "logging": {"target_bucket": "acme-access-logs"},
+      "versioning": {"status": "Enabled", "mfadelete": "Enabled"},
+      "public_access_block": {"block_public_acls": true, "ignore_public_acls": true, "block_public_policy": true, "restrict_public_buckets": true}
+    }
+  ],
+  "security_groups": [
+    {
+      "group_id": "sg-0admin111",
+      "group_name": "admin-bastion",
+      "description": "should be locked down",
+      "ingress": [
+        {"protocol": "tcp", "from_port": 22, "to_port": 22, "cidrs": ["0.0.0.0/0"], "ipv6": []},
+        {"protocol": "tcp", "from_port": 3389, "to_port": 3389, "cidrs": ["0.0.0.0/0"], "ipv6": []},
+        {"protocol": "tcp", "from_port": 443, "to_port": 443, "cidrs": ["10.0.0.0/8"], "ipv6": []}
+      ],
+      "egress": []
+    },
+    {
+      "group_id": "sg-0web222",
+      "group_name": "web-tier",
+      "description": "public web",
+      "ingress": [
+        {"protocol": "tcp", "from_port": 80, "to_port": 80, "cidrs": ["0.0.0.0/0"], "ipv6": []},
+        {"protocol": "tcp", "from_port": 443, "to_port": 443, "cidrs": ["0.0.0.0/0"], "ipv6": []}
+      ],
+      "egress": []
+    },
+    {
+      "group_id": "sg-0wide333",
+      "group_name": "legacy-open",
+      "description": "everything open",
+      "ingress": [
+        {"protocol": "-1", "from_port": null, "to_port": null, "cidrs": ["0.0.0.0/0"], "ipv6": []}
+      ],
+      "egress": []
+    }
+  ],
+  "instances": [
+    {"instance_id": "i-0old1", "public_ip": "54.1.2.3", "private_ip": "10.0.1.10", "imds_v2": false, "security_groups": ["sg-0admin111"]},
+    {"instance_id": "i-0new2", "public_ip": "54.1.2.4", "private_ip": "10.0.1.11", "imds_v2": true, "security_groups": ["sg-0web222"]}
+  ],
+  "volumes": [
+    {"volume_id": "vol-0plain", "encrypted": false, "state": "in-use"},
+    {"volume_id": "vol-0enc", "encrypted": true, "state": "in-use"}
+  ],
+  "rds_instances": [
+    {"db_instance_identifier": "prod-db", "publicly_accessible": true, "storage_encrypted": false, "backup_retention_period": 1, "multi_az": false}
+  ],
+  "cloud_trails": [],
+  "identities": [],
+  "policies": [],
+  "resources": []
+}

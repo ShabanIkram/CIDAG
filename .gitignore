@@ -22,7 +22,13 @@ htmlcov/
 
 # Secrets & scan data (never commit)
 data/*.json
+cidag/data/*.json
 !cidag/data/mock_aws.json
+!cidag/data/mock_scanners.json
 *.pem
 credentials
 .env
+
+# Local NVD CVE mirror (large, regenerated via `cidag nvd sync`)
+*.sqlite3
+*.sqlite3-journal
