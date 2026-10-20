@@ -4,6 +4,38 @@ from botocore.exceptions import BotoCoreError, ClientError
 from .base import BaseCollector
 
 
+class AwsCredentialsError(RuntimeError):
+    """Live collection requested but no AWS credentials resolve."""
+
+
+class AwsCollectionError(RuntimeError):
+    """A live AWS collector failed.
+
+    Continuing with a partial/empty inventory would silently turn "we could not
+    query" into findings like "No CloudTrail configured" -- fabricated positives.
+    """
+
+
+def verify_credentials(profile: str | None = None, region: str = "us-east-1"):
+    """Resolve credentials before any live collection.
+
+    Returns the boto3 Session or raises AwsCredentialsError. Credential
+    resolution only (SSO providers may refresh a token); no AWS data API call.
+    """
+    try:
+        session = boto3.Session(profile_name=profile, region_name=region)
+        creds = session.get_credentials()
+    except BotoCoreError as e:  # ProfileNotFound, PartialCredentialsError, ...
+        raise AwsCredentialsError(str(e)) from e
+    if creds is None:
+        where = f"profile {profile!r}" if profile else "the default credential chain"
+        hint = f"aws sso login --profile {profile}" if profile else "aws configure"
+        raise AwsCredentialsError(
+            f"no AWS credentials found via {where}. Run `{hint}` or export "
+            f"AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.")
+    return session
+
+
 def _paginate(client, method_name: str, result_key: str, **kwargs):
     paginator = client.get_paginator(method_name)
     for page in paginator.paginate(**kwargs):
@@ -11,12 +43,15 @@ def _paginate(client, method_name: str, result_key: str, **kwargs):
 
 
 class AwsCollector(BaseCollector):
-    def __init__(self, profile: str | None = None, region: str = "us-east-1"):
+    def __init__(self, profile: str | None = None, region: str = "us-east-1",
+                 session=None):
         self.profile = profile
         self.region = region
+        self.session = session
 
     def collect(self) -> dict:
-        session = boto3.Session(profile_name=self.profile, region_name=self.region)
+        session = self.session or boto3.Session(profile_name=self.profile,
+                                                region_name=self.region)
         iam = session.client("iam")
         identities: list[dict] = []
         policies: list[dict] = []

@@ -103,8 +103,9 @@ async def _grab_banner(host: str, port: int) -> str:
 
 async def _scan_host(host: str, ports: Iterable[int], sem: asyncio.Semaphore) -> list[dict]:
     open_ports: list[dict] = []
-    async with sem:
-        async def probe(port: int):
+
+    async def probe(port: int):
+        async with sem:
             try:
                 conn = asyncio.open_connection(host, port)
                 reader, writer = await asyncio.wait_for(conn, timeout=_CONNECT_TIMEOUT)
@@ -118,12 +119,12 @@ async def _scan_host(host: str, ports: Iterable[int], sem: asyncio.Semaphore) ->
             banner = await _grab_banner(host, port)
             open_ports.append({"host": host, "port": port, "banner": banner})
 
-        await asyncio.gather(*(probe(p) for p in ports))
+    await asyncio.gather(*(probe(p) for p in ports))
     return open_ports
 
 
 def _expand_targets(cidrs: Iterable[str], max_hosts: int, allow_private: bool,
-                    log) -> list[str]:
+                    log, label: str = "net") -> list[str]:
     """Expand CIDR/IP allowlist entries into individual host IPs to scan.
 
     Private addresses are skipped unless ``allow_private`` is set (the
@@ -147,7 +148,7 @@ def _expand_targets(cidrs: Iterable[str], max_hosts: int, allow_private: bool,
     if len(hosts) > max_hosts:
         raise OutOfScopeError(
             f"{len(hosts)} hosts exceed max-hosts={max_hosts}; narrow --targets or raise the cap")
-    log(f"    net: {len(hosts)} in-scope host(s) after expansion")
+    log(f"    {label}: {len(hosts)} in-scope host(s) after expansion")
     return hosts
 
 
@@ -182,7 +183,7 @@ class NetworkScanner:
         context.log(f"    net: scanning {len(hosts)} host(s) x {len(ports)} ports")
 
         sem = asyncio.Semaphore(concurrency)
-        results = asyncio.run(self._run_async(hosts, ports, sem))
+        results = asyncio.run(self._run_async(hosts, ports, sem, log=context.log))
 
         findings: list[Finding] = []
         services: list[DetectedService] = []
@@ -209,15 +210,20 @@ class NetworkScanner:
                 context.log(f"    net: CVE correlation skipped ({e})")
 
         context.log(f"    net: {len(results)} open ports -> {len(findings)} findings")
+        if not results:
+            context.log("    net: no open ports found - if unexpected, check the target "
+                        "is up (ping) and reachable from this host")
         return findings
 
-    async def _run_async(self, targets, ports, sem) -> list[dict]:
+    async def _run_async(self, targets, ports, sem, log=None) -> list[dict]:
         tasks = [_scan_host(t, ports, sem) for t in targets]
         nested = await asyncio.gather(*tasks, return_exceptions=True)
         out: list[dict] = []
         for item in nested:
             if isinstance(item, list):
                 out.extend(item)
+            elif log is not None and isinstance(item, BaseException):
+                log(f"    net: host scan failed: {item!r}")
         return out
 
     def _open_port_finding(self, r: dict) -> list[Finding]:

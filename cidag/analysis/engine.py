@@ -14,6 +14,10 @@ def _add_can_pass_edges(g: nx.DiGraph, perms: dict[str, EffectivePermissions]) -
             continue
         for pattern in ep.passrole_targets():
             for role_arn in role_arns:
+                if role_arn == arn:
+                    # An identity cannot "pass" itself; a wildcard PassRole
+                    # pattern would otherwise emit a meaningless self-loop.
+                    continue
                 if resource_matches(pattern, role_arn):
                     g.add_edge(arn, role_arn, rel="can-pass")
 

@@ -4,19 +4,28 @@ import sys
 from pathlib import Path
 
 from cidag.analysis.engine import admin_paths, blast_radius, run_analysis
-from cidag.collectors.aws import AwsCollector
+from cidag.collectors.aws import (
+    AwsCollectionError,
+    AwsCollector,
+    AwsCredentialsError,
+    verify_credentials,
+)
 from cidag.collectors.base import MockCollector
 from cidag.core.finding import Finding, Severity
 from cidag.core.context import ScanContext
 from cidag.core.scope import ScopeGuard, OutOfScopeError
 from cidag.graph.builder import build_graph
-from cidag.reports.exporter import to_csv, to_json, to_markdown
+from cidag.graph.viz import to_dot, to_mermaid, to_mermaid_paths, to_svg
+from cidag.reports.compliance import attach as attach_compliance
+from cidag.reports.compliance import filter_by as filter_compliance
+from cidag.reports.compliance import summary as compliance_summary
+from cidag.reports.exporter import to_csv, to_json, to_markdown, to_sarif
 
 # Register every bundled scanner.
 import cidag.scanners  # noqa: F401
 from cidag.core.registry import all_scanners, run_scanners
 
-SCANNER_MODULES = ("s3", "ec2", "net", "inspector", "sechub", "import")
+SCANNER_MODULES = ("s3", "ec2", "net", "policy", "nuclei", "inspector", "sechub", "import")
 ALL_MODULES = ("iam",) + SCANNER_MODULES
 # modules that need AWS creds but no pre-collected inventory
 _LIVE_API_MODULES = ("inspector", "sechub")
@@ -25,6 +34,16 @@ _LIVE_API_MODULES = ("inspector", "sechub")
 def _log(msg: str) -> None:
     """Status/progress messages go to stderr so stdout stays machine-clean."""
     print(msg, file=sys.stderr)
+
+
+def _emit(text: str, args) -> None:
+    path = getattr(args, "output", None)
+    if path:
+        Path(path).write_text(text if text.endswith("\n") else text + "\n",
+                              encoding="utf-8")
+        print(f"[+] wrote {path}")
+    else:
+        print(text)
 
 
 def _parse_ports(spec: str | None) -> list[int] | None:
@@ -73,6 +92,9 @@ def _get_inventory(args, modules: list[str] | None = None) -> dict:
     modules = modules or ["iam"]
     live = getattr(args, "profile", None) or getattr(args, "live", False)
     if live:
+        # Fail fast: an empty inventory from dead credentials must never be
+        # rendered as "these resources are absent" findings.
+        verify_credentials(args.profile, args.region)
         _log("[*] Collecting from AWS (read-only)...")
         inv = AwsCollector(profile=args.profile, region=args.region).collect()
         _collect_live_scanners(args, inv, modules)
@@ -87,11 +109,12 @@ def _get_inventory(args, modules: list[str] | None = None) -> dict:
     return inv
 
 
-def _collect_live_scanners(args, inv: dict, modules: list[str]) -> None:
+def _collect_live_scanners(args, inv: dict, modules: list[str], session=None) -> None:
     import boto3
     if not any(m in modules for m in SCANNER_MODULES):
         return
-    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    session = session or boto3.Session(profile_name=args.profile,
+                                       region_name=args.region)
     if "s3" in modules:
         try:
             from cidag.scanners.s3.collector import collect_s3
@@ -100,7 +123,7 @@ def _collect_live_scanners(args, inv: dict, modules: list[str]) -> None:
             inv["account_public_access_block"] = pab
             _log(f"[*] Collected {len(buckets)} S3 buckets")
         except Exception as e:
-            print(f"[!] s3 collection failed: {e}")
+            raise AwsCollectionError(f"s3 collection failed: {e}") from e
     if "ec2" in modules:
         try:
             from cidag.scanners.ec2.collector import (
@@ -112,7 +135,7 @@ def _collect_live_scanners(args, inv: dict, modules: list[str]) -> None:
                   f"{len(inv.get('instances', []))} instances, "
                   f"{len(inv.get('rds_instances', []))} RDS")
         except Exception as e:
-            print(f"[!] ec2 collection failed: {e}")
+            raise AwsCollectionError(f"ec2 collection failed: {e}") from e
 
 
 def _build_scope(args) -> ScopeGuard:
@@ -139,9 +162,8 @@ def _iam_finding(f: dict) -> Finding:
     )
 
 
-def _run_unified(args, modules: list[str]):
-    """Return (inventory, g, iam_result_or_None, findings[Finding])."""
-    inventory = _get_inventory(args, modules)
+def _scan_inventory(args, inventory: dict, modules: list[str]):
+    """Run IAM analysis + scanner modules against one inventory."""
     g = iam_result = None
     findings: list[Finding] = []
     if "iam" in modules:
@@ -158,11 +180,14 @@ def _run_unified(args, modules: list[str]):
                 "targets": getattr(args, "targets", None) or [],
                 "ports": _parse_ports(getattr(args, "ports", None)),
                 "max_hosts": getattr(args, "max_hosts", 1024),
+                "allow_private": bool(getattr(args, "allow_private", False)),
                 "nvd_network": not getattr(args, "no_nvd", False),
                 "profile": getattr(args, "profile", None),
                 "region": getattr(args, "region", "us-east-1"),
                 "import_path": getattr(args, "import_path", None),
                 "import_format": getattr(args, "import_format", None),
+                "nuclei_templates": getattr(args, "nuclei_templates", None),
+                "nuclei_severity": getattr(args, "nuclei_severity", None),
             },
             log=_log,
             offline=bool(getattr(args, "no_nvd", False)),
@@ -172,6 +197,77 @@ def _run_unified(args, modules: list[str]):
     if min_sev:
         floor = Severity.parse(min_sev)
         findings = [f for f in findings if f.severity >= floor]
+    attach_compliance(findings)
+    return g, iam_result, findings
+
+
+def _run_org(args, modules: list[str]):
+    """Scan every active account in AWS Organizations via an assumed role."""
+    if not getattr(args, "live", False):
+        raise AwsCollectionError(
+            "--all-accounts requires --live and AWS Organizations credentials")
+    import boto3
+
+    from cidag.collectors.org import assume_role_session, list_accounts
+
+    base = boto3.Session(profile_name=args.profile, region_name=args.region)
+    try:
+        accounts = list_accounts(base)
+    except Exception as e:
+        raise AwsCollectionError(f"organizations:ListAccounts failed: {e}") from e
+    wanted = set(getattr(args, "account_ids", None) or [])
+    if wanted:
+        accounts = [a for a in accounts if a["id"] in wanted]
+    if not accounts:
+        raise AwsCollectionError("no active organization accounts to scan")
+
+    role_name = getattr(args, "role_name", "OrganizationAccountAccessRole")
+    # net/nuclei targets are external to the accounts: run them once, untagged.
+    network_mods = [m for m in modules if m in ("net", "nuclei")]
+    aws_modules = [m for m in modules if m not in network_mods]
+    findings: list[Finding] = []
+    for acct in accounts:
+        try:
+            session = assume_role_session(base, acct["id"], role_name, args.region)
+        except Exception as e:
+            raise AwsCollectionError(
+                f"cannot assume {role_name} in account {acct['id']}: {e}") from e
+        _log(f"[*] Scanning account {acct['id']} ({acct.get('name', '')})")
+        try:
+            inventory = AwsCollector(region=args.region, session=session).collect()
+            _collect_live_scanners(args, inventory, modules, session=session)
+        except AwsCollectionError:
+            raise
+        except Exception as e:
+            raise AwsCollectionError(
+                f"collection failed in account {acct['id']}: {e}") from e
+        inventory["account_id"] = acct["id"]
+        inventory["account_name"] = acct.get("name", acct["id"])
+        _, _, acct_findings = _scan_inventory(args, inventory, aws_modules)
+        for f in acct_findings:
+            f.set_account(acct["id"])
+        findings.extend(acct_findings)
+
+    summary = {
+        "account_id": f"org:{len(accounts)}",
+        "region": args.region,
+        "accounts": [{"id": a["id"], "name": a.get("name")} for a in accounts],
+        "identities": [],
+        "policies": [],
+        "resources": [],
+    }
+    if network_mods:
+        _, _, network_findings = _scan_inventory(args, summary, network_mods)
+        findings.extend(network_findings)
+    return summary, None, None, findings
+
+
+def _run_unified(args, modules: list[str]):
+    """Return (inventory, g, iam_result_or_None, findings[Finding])."""
+    if getattr(args, "all_accounts", False):
+        return _run_org(args, modules)
+    inventory = _get_inventory(args, modules)
+    g, iam_result, findings = _scan_inventory(args, inventory, modules)
     return inventory, g, iam_result, findings
 
 
@@ -221,6 +317,8 @@ def _print_findings(inventory, modules, findings: list[Finding]) -> None:
         cve = f"  [{f.cve}]" if f.cve else ""
         print(f"\n [{i}] {f.severity.name} - {f.check_id}{cve}  ({f.module})")
         print(f"    Target: {f.target}")
+        if f.account:
+            print(f"    Account: {f.account}")
         if f.chain:
             print(f"    Chain: {' -> '.join(f.chain)}")
         print(f"    Title: {f.title}")
@@ -232,8 +330,19 @@ def _print_findings(inventory, modules, findings: list[Finding]) -> None:
 def cmd_graph(args):
     inventory = _get_inventory(args, ["iam"])
     g = build_graph(inventory)
-    for u, v, data in g.edges(data=True):
-        print(f"{g.nodes[u]['label']:>25} --{data['rel']}--> {g.nodes[v]['label']}")
+    fmt = getattr(args, "format", "text")
+    if fmt == "mermaid":
+        out = to_mermaid(g)
+    elif fmt == "dot":
+        out = to_dot(g)
+    elif fmt == "svg":
+        highlight = set(run_analysis(g, inventory).get("admin_arns", []))
+        out = to_svg(g, highlight=highlight)
+    else:
+        out = "\n".join(
+            f"{g.nodes[u]['label']:>25} --{data['rel']}--> {g.nodes[v]['label']}"
+            for u, v, data in g.edges(data=True))
+    _emit(out, args)
 
 
 def cmd_paths(args):
@@ -244,8 +353,11 @@ def cmd_paths(args):
     if not paths:
         print("[OK] No paths to admin found.")
         return
-    for ident, chain in paths.items():
-        print(f"{ident}: {' -> '.join(chain)}")
+    if getattr(args, "format", "text") == "mermaid":
+        _emit(to_mermaid_paths(paths), args)
+        return
+    out = "\n".join(f"{ident}: {' -> '.join(chain)}" for ident, chain in paths.items())
+    _emit(out, args)
 
 
 def cmd_blast(args):
@@ -265,6 +377,7 @@ def cmd_blast(args):
 def cmd_report(args):
     modules = _modules(args)
     inventory, g, iam_result, findings = _run_unified(args, modules)
+    findings = filter_compliance(findings, getattr(args, "compliance", None))
     if args.format == "json":
         content = json.dumps({
             "account_id": inventory.get("account_id"),
@@ -282,12 +395,17 @@ def cmd_report(args):
             w.writerow([f.severity.name, f.module, f.check_id, f.target,
                         f.title, f.cve or "", f.remediation])
         content = buf.getvalue()
+    elif args.format == "sarif":
+        content = to_sarif(findings)
     else:
-        if iam_result is None:
-            # markdown for non-IAM modules
+        if iam_result is None or getattr(args, "compliance", None):
+            # markdown for non-IAM modules / compliance-filtered reports
             content = _md_findings(inventory, modules, findings)
         else:
             content = to_markdown(inventory, iam_result)
+            extra = _compliance_md(findings)
+            if extra:
+                content = content.rstrip() + "\n" + extra
     if args.output:
         Path(args.output).write_text(content)
         _log(f"[*] Report Written -> {args.output}")
@@ -310,11 +428,80 @@ def _md_findings(inventory, modules, findings) -> str:
         cve = f" ({f.cve})" if f.cve else ""
         lines.append(f"### {i}. [{f.severity.name}] {f.check_id}{cve} — {f.target}")
         lines.append(f"- **Module:** {f.module}")
+        if f.account:
+            lines.append(f"- **Account:** {f.account}")
         lines.append(f"- **Title:** {f.title}")
         if f.remediation:
             lines.append(f"- **Remediation:** {f.remediation}")
         lines.append("")
+    content = "\n".join(lines)
+    extra = _compliance_md(findings)
+    return content.rstrip() + "\n" + extra if extra else content
+
+
+def _compliance_md(findings) -> str:
+    data = compliance_summary(findings)
+    if not data:
+        return ""
+    lines = ["", "## Compliance Coverage", ""]
+    labels = {"cis": "CIS AWS Foundations", "pci": "PCI DSS v4.0"}
+    for framework in sorted(data):
+        lines.append(f"### {labels.get(framework, framework)}")
+        lines.append("")
+        for control, count in sorted(data[framework].items()):
+            lines.append(f"- `{control}` — {count} finding(s)")
+        lines.append("")
     return "\n".join(lines)
+
+
+def _diff_key(finding: dict) -> str:
+    if finding.get("id"):
+        return str(finding["id"])
+    return f"{finding.get('module')}|{finding.get('check_id')}|{finding.get('target')}"
+
+
+def _load_findings(path: str) -> dict[str, dict]:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    items = data.get("findings", []) if isinstance(data, dict) else data
+    return {_diff_key(f): f for f in items if isinstance(f, dict)}
+
+
+def _diff_sev(finding: dict) -> Severity:
+    try:
+        return Severity.parse(finding.get("severity", "INFO"))
+    except ValueError:
+        return Severity.INFO
+
+
+def cmd_diff(args):
+    before = _load_findings(args.before)
+    after = _load_findings(args.after)
+    added = [after[k] for k in after.keys() - before.keys()]
+    fixed = [before[k] for k in before.keys() - after.keys()]
+    changed = [(before[k], after[k]) for k in before.keys() & after.keys()
+               if before[k].get("severity") != after[k].get("severity")]
+    added.sort(key=lambda f: -int(_diff_sev(f)))
+    fixed.sort(key=lambda f: -int(_diff_sev(f)))
+    if args.format == "json":
+        out = json.dumps({
+            "summary": {"new": len(added), "fixed": len(fixed), "changed": len(changed)},
+            "new": added,
+            "fixed": fixed,
+            "changed": [{"before": b, "after": a} for b, a in changed],
+        }, indent=2, default=str)
+    else:
+        def line(tag: str, severity: str, f: dict) -> str:
+            return (f"{tag:<8} {severity:<12} {str(f.get('module', '')):<6} "
+                    f"{str(f.get('check_id', '')):<12} {str(f.get('target', ''))}  "
+                    f"{f.get('title', '')}")
+
+        lines = [f"[+] {len(added)} new  [-] {len(fixed)} fixed  [~] {len(changed)} changed"]
+        lines += [line("NEW", str(f.get("severity", "?")), f) for f in added]
+        lines += [line("FIXED", str(f.get("severity", "?")), f) for f in fixed]
+        for b, a in changed:
+            lines.append(line("CHANGED", f"{b.get('severity')}->{a.get('severity')}", a))
+        out = "\n".join(lines)
+    _emit(out, args)
 
 
 def cmd_nvd(args):
@@ -333,6 +520,12 @@ def _add_common(p):
     p.add_argument("--profile", "-p", help="AWS profile")
     p.add_argument("--region", "-r", default="us-east-1")
     p.add_argument("--live", action="store_true", help="Use default AWS credentials")
+    p.add_argument("--all-accounts", action="store_true",
+                   help="Scan every active AWS Organizations account (live only)")
+    p.add_argument("--role-name", default="OrganizationAccountAccessRole",
+                   help="Role to assume in member accounts (default: %(default)s)")
+    p.add_argument("--account-id", action="append", dest="account_ids", default=[],
+                   help="Limit --all-accounts to an account id (repeatable)")
     p.add_argument("--save", help="Save collected inventory to file")
 
 
@@ -353,6 +546,10 @@ def _add_scan_flags(p):
     p.add_argument("--import-path", help="Path to nmap XML / nuclei JSON / Prowler JSON to import")
     p.add_argument("--import-format", choices=["nmap", "nuclei", "prowler"],
                    help="Format of --import-path")
+    p.add_argument("--nuclei-templates",
+                   help="Templates dir for the live nuclei bridge (module nuclei)")
+    p.add_argument("--nuclei-severity",
+                   help="Severity filter for nuclei, e.g. critical,high")
 
 
 def main(argv=None):
@@ -363,20 +560,33 @@ def main(argv=None):
 
     for name, help_text, func in [
         ("scan", "Run scan (IAM attack graph + s3/ec2/net/cve modules)", cmd_scan),
-        ("graph", "Print IAM graph edges", cmd_graph),
+        ("graph", "Render IAM attack graph (text/mermaid/svg/dot)", cmd_graph),
         ("paths", "List attack paths to admin", cmd_paths),
         ("blast", "Blast radius of an identity", cmd_blast),
-        ("report", "Generate report (md/json/csv)", cmd_report),
+        ("report", "Generate report (md/json/csv/sarif)", cmd_report),
+        ("diff", "Diff two report JSON files (new/fixed/changed findings)", cmd_diff),
     ]:
         p = sub.add_parser(name, help=help_text)
         _add_common(p)
         _add_scan_flags(p)
         if name == "scan":
             p.add_argument("--json", action="store_true")
+        if name in ("graph", "paths"):
+            choices = ["text", "mermaid"] + (["svg", "dot"] if name == "graph" else [])
+            p.add_argument("--format", choices=choices, default="text",
+                           help="Output format (mermaid for READMEs, svg for a visual graph)")
+            p.add_argument("--output", "-o", help="Write output to a file instead of stdout")
         if name == "blast":
             p.add_argument("--identity", required=True)
         if name == "report":
-            p.add_argument("--format", choices=["md", "json", "csv"], default="md")
+            p.add_argument("--format", choices=["md", "json", "csv", "sarif"], default="md")
+            p.add_argument("--compliance", choices=["cis", "pci"],
+                           help="Only report findings mapped to this framework")
+            p.add_argument("--output", "-o")
+        if name == "diff":
+            p.add_argument("--before", required=True, help="Report JSON before the change")
+            p.add_argument("--after", required=True, help="Report JSON after the change")
+            p.add_argument("--format", choices=["text", "json"], default="text")
             p.add_argument("--output", "-o")
         p.set_defaults(func=func)
 
@@ -390,7 +600,13 @@ def main(argv=None):
     p_count.set_defaults(func=cmd_nvd)
 
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (AwsCredentialsError, AwsCollectionError) as e:
+        # One catch point: every subcommand that touches AWS stops here
+        # instead of reporting a plausible-looking but fabricated scan.
+        print(f"[!] LIVE SCAN ABORTED: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

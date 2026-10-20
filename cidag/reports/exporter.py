@@ -8,6 +8,59 @@ def to_json(result: dict) -> str:
     return json.dumps(result, indent=2, default=str)
 
 
+_SARIF_LEVELS = {
+    "CRITICAL": "error", "HIGH": "error",
+    "MEDIUM": "warning", "LOW": "note", "INFO": "note",
+}
+
+
+def to_sarif(findings: list, repo_uri: str = "https://github.com/ShabanIkram/CIDAG") -> str:
+    """SARIF 2.1.0 for GitHub code scanning / CI security gates."""
+    rules: dict[str, dict] = {}
+    results: list[dict] = []
+    for f in findings:
+        severity = f.severity.name if hasattr(f.severity, "name") else str(f.severity)
+        rule_id = str(f.check_id)
+        if rule_id not in rules:
+            rules[rule_id] = {
+                "id": rule_id,
+                "name": rule_id.replace("-", ""),
+                "shortDescription": {"text": str(f.title)},
+                "help": {"text": str(f.remediation or f.title)},
+                "properties": {"tags": [f.module] + ([f.cve] if f.cve else [])},
+            }
+        results.append({
+            "ruleId": rule_id,
+            "level": _SARIF_LEVELS.get(severity, "note"),
+            "message": {"text": str(f.title)},
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": str(f.target)}}}],
+            "partialFingerprints": {"cidagFindingId": str(f.id)},
+            "properties": {
+                "module": f.module,
+                "severity": severity,
+                **({"cve": f.cve} if f.cve else {}),
+                **({"account": f.account} if f.account else {}),
+                **({"compliance": f.compliance} if f.compliance else {}),
+                **({"remediation": f.remediation} if f.remediation else {}),
+            },
+        })
+    doc = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "CIDAG",
+                "version": "2.0",
+                "informationUri": repo_uri,
+                "rules": list(rules.values()),
+            }},
+            "results": results,
+        }],
+    }
+    return json.dumps(doc, indent=2, default=str)
+
+
 def to_csv(findings: list[dict]) -> str:
     fields = ["severity", "type", "identity", "reason", "remediation"]
     buf = io.StringIO()

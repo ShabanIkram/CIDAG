@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..core.finding import Finding, Severity
-from .cpe import DetectedService, match_cpe, version_lt, version_lte
+from .cpe import DetectedService, match_cpe, version_gte, version_lt, version_lte
 from .nvd import CVE, NVDClient
 
 # NVD severity string -> our Severity
@@ -42,32 +42,39 @@ class SeedRule:
     severity: Severity
     title: str
     remediation: str
+    affected_from: str = ""        # inclusive lower bound ("" = no bound)
 
 
 # Small, famous, offline-demo seed set. The NVD mirror is the real database;
 # this only guarantees the engine is useful on a cold cache.
+#
+# Both bounds matter: without affected_from an old release reports a CVE that
+# never applied to it (Apache 2.2.8 "CVE-2021-41773", OpenSSH 4.7p1
+# "CVE-2016-0777") -- a false positive on every legacy box you scan.
 SEED_RULES: list[SeedRule] = [
     SeedRule("apache http server", "2.4.51", "CVE-2021-41773", Severity.CRITICAL,
              "Apache path traversal / RCE (2.4.49-2.4.50)",
-             "Upgrade Apache httpd to 2.4.51 or later"),
+             "Upgrade Apache httpd to 2.4.51 or later", affected_from="2.4.49"),
     SeedRule("apache http server", "2.4.51", "CVE-2021-42013", Severity.CRITICAL,
              "Apache path traversal / RCE follow-up",
-             "Upgrade Apache httpd to 2.4.51 or later"),
+             "Upgrade Apache httpd to 2.4.51 or later", affected_from="2.4.49"),
     SeedRule("openssh", "7.4", "CVE-2016-0777", Severity.HIGH,
              "OpenSSH client info leak / command injection (roaming)",
-             "Upgrade OpenSSH; disable roaming client"),
+             "Upgrade OpenSSH; disable roaming client", affected_from="5.4"),
     SeedRule("proftpd", "1.3.6", "CVE-2019-12815", Severity.CRITICAL,
              "ProFTPD mod_copy arbitrary command execution",
-             "Upgrade ProFTPD to 1.3.6 or later / remove mod_copy"),
-    SeedRule("vsftpd", "3.0.3", "CVE-2011-2523", Severity.CRITICAL,
+             "Upgrade ProFTPD to 1.3.6 or later / remove mod_copy",
+             affected_from="1.3.5"),
+    SeedRule("vsftpd", "2.3.5", "CVE-2011-2523", Severity.CRITICAL,
              "vsftpd 2.3.4 backdoor (smiley face)",
-             "Reinstall genuine vsftpd; the backdoored build is not upstream"),
+             "Reinstall genuine vsftpd; the backdoored build is not upstream",
+             affected_from="2.3.4"),
     SeedRule("redis", "6.2.7", "CVE-2022-0543", Severity.CRITICAL,
              "Redis Lua sandbox escape / RCE (Debian/Ubuntu)",
-             "Upgrade Redis; restrict network exposure"),
+             "Upgrade Redis; restrict network exposure", affected_from="4.0"),
     SeedRule("openssl", "1.0.2k", "CVE-2016-2107", Severity.HIGH,
              "OpenSSL padding oracle (CVE-2016-2107)",
-             "Upgrade OpenSSL to a patched release"),
+             "Upgrade OpenSSL to a patched release", affected_from="1.0.1"),
 ]
 
 
@@ -76,26 +83,31 @@ def _seed_matches(detected: DetectedService) -> list[Finding]:
     if not detected.version:
         return out
     for rule in SEED_RULES:
-        if _similar(rule.product, detected.product) and version_lt(detected.version, rule.affected_below):
-            loc = f"{detected.product}:{detected.version}"
-            if detected.port:
-                loc = f"{detected.product}:{detected.version} (:{detected.port})"
-            out.append(Finding(
-                module="cve",
-                check_id=rule.cve_id,
-                severity=rule.severity,
-                title=f"{rule.title} — {loc}",
-                target=loc,
-                remediation=rule.remediation,
-                cve=rule.cve_id,
-                evidence={
-                    "product": detected.product,
-                    "version": detected.version,
-                    "port": detected.port,
-                    "banner": detected.banner[:200],
-                    "source": "seed-rules",
-                },
-            ))
+        if not _similar(rule.product, detected.product):
+            continue
+        if not version_lt(detected.version, rule.affected_below):
+            continue
+        if rule.affected_from and not version_gte(detected.version, rule.affected_from):
+            continue
+        loc = f"{detected.product}:{detected.version}"
+        if detected.port:
+            loc = f"{detected.product}:{detected.version} (:{detected.port})"
+        out.append(Finding(
+            module="cve",
+            check_id=rule.cve_id,
+            severity=rule.severity,
+            title=f"{rule.title} — {loc}",
+            target=loc,
+            remediation=rule.remediation,
+            cve=rule.cve_id,
+            evidence={
+                "product": detected.product,
+                "version": detected.version,
+                "port": detected.port,
+                "banner": detected.banner[:200],
+                "source": "seed-rules",
+            },
+        ))
     return out
 
 
@@ -167,11 +179,13 @@ class CVEEngine:
     def _query_nvd(self, svc: DetectedService) -> list[CVE]:
         try:
             cpe = svc.to_cpe()
-            cves = self.nvd.search_cpe(cpe, use_cache=True)
+            # use_network=False (--no-nvd): read the local mirror only, never the API
+            net = self.use_network
+            cves = self.nvd.search_cpe(cpe, use_cache=True, allow_network=net)
             if cves:
                 return cves
             # versioned CPE returned nothing -> try product keyword (wider net)
-            return self.nvd.search_keyword(svc.product, use_cache=True)
+            return self.nvd.search_keyword(svc.product, use_cache=True, allow_network=net)
         except Exception as e:  # network/API issues must never crash a scan
             self.log(f"[!] NVD query failed for {svc.product}: {e}")
             return []

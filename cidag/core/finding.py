@@ -43,9 +43,13 @@ class Severity(IntEnum):
         raise ValueError(f"cannot parse severity from {value!r}")
 
 
-def _stable_id(module: str, check_id: str, target: str) -> str:
-    raw = f"{module}|{check_id}|{target}".encode("utf-8")
-    return hashlib.sha1(raw).hexdigest()[:12]
+def _stable_id(module: str, check_id: str, target: str,
+               account: str | None = None) -> str:
+    raw = f"{module}|{check_id}|{target}"
+    if account:
+        # Same resource name can exist in every account of an organization.
+        raw = f"{account}|{raw}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
 @dataclass
@@ -61,6 +65,8 @@ class Finding:
     evidence: dict = field(default_factory=dict)
     cve: str | None = None         # CVE id when this finding maps to one
     cwe: str | None = None
+    account: str | None = None     # AWS account id (multi-account scans)
+    compliance: dict = field(default_factory=dict)  # {"cis": [...], "pci": [...]}
     detected_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
     )
@@ -75,9 +81,14 @@ class Finding:
     def __post_init__(self) -> None:
         self.severity = Severity.parse(self.severity)
         if not self.id:
-            self.id = _stable_id(self.module, self.check_id, self.target)
+            self.id = _stable_id(self.module, self.check_id, self.target, self.account)
         if self.reason is None:
             self.reason = self.title
+
+    def set_account(self, account: str) -> None:
+        """Tag the finding with its account and refresh the stable id."""
+        self.account = account
+        self.id = _stable_id(self.module, self.check_id, self.target, account)
 
     def to_dict(self) -> dict:
         d = asdict(self)

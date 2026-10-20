@@ -222,7 +222,7 @@ class NVDClient:
         )
         self._conn.commit()
 
-    def _query(self, params: dict, use_cache: bool = True) -> list[CVE]:
+    def _query(self, params: dict, use_cache: bool = True, allow_network: bool = True) -> list[CVE]:
         cache_key = json.dumps(params, sort_keys=True)
         if use_cache:
             cached = self._cache_get(cache_key)
@@ -233,6 +233,9 @@ class NVDClient:
                     if cve:
                         out.append(cve)
                 return out
+        if not allow_network:
+            # offline mode: a cold cache must not fall through to the live API
+            return []
         results: list[CVE] = []
         start = 0
         while True:
@@ -248,12 +251,16 @@ class NVDClient:
         self._cache_put(cache_key, [c.cve_id for c in results])
         return results
 
-    def search_keyword(self, keyword: str, use_cache: bool = True) -> list[CVE]:
-        return self._query({"keywordSearch": keyword}, use_cache=use_cache)
+    def search_keyword(self, keyword: str, use_cache: bool = True,
+                       allow_network: bool = True) -> list[CVE]:
+        return self._query({"keywordSearch": keyword}, use_cache=use_cache,
+                           allow_network=allow_network)
 
-    def search_cpe(self, cpe: str, use_cache: bool = True) -> list[CVE]:
+    def search_cpe(self, cpe: str, use_cache: bool = True,
+                   allow_network: bool = True) -> list[CVE]:
         """cpe:2.3:part:vendor:product:version:..."""
-        return self._query({"cpeName": cpe}, use_cache=use_cache)
+        return self._query({"cpeName": cpe}, use_cache=use_cache,
+                           allow_network=allow_network)
 
     def search_severity(self, severity: str, days: int = 30, use_cache: bool = True) -> list[CVE]:
         start = datetime.now(timezone.utc) - timedelta(days=days)

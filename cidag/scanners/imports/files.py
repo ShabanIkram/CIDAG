@@ -45,11 +45,16 @@ def parse_nmap_xml(path: str) -> list[Finding]:
 
 
 def parse_nuclei_json(path: str) -> list[Finding]:
-    """Parse nuclei -json output into findings with real CVE/template ids."""
+    """Parse a nuclei -json output file into findings."""
+    return parse_nuclei_lines(Path(path).read_text(encoding="utf-8"))
+
+
+def parse_nuclei_lines(text: str) -> list[Finding]:
+    """Parse nuclei JSONL (one JSON object per line) into findings."""
     findings: list[Finding] = []
     sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
                "medium": Severity.MEDIUM, "low": Severity.LOW, "info": Severity.INFO}
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue

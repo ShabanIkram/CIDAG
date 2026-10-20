@@ -52,4 +52,19 @@ ESCALATION_RULES = [
      "requires": [["iam:AddUserToGroup"]],
      "severity": "HIGH",
      "remediation": "Restrict iam:AddUserToGroup to specific groups"},
+
+    {"id": "ESC-11", "name": "UpdateAssumeRolePolicy (hijack role trust)",
+     "requires": [["iam:UpdateAssumeRolePolicy"]],
+     "severity": "CRITICAL",
+     "remediation": "Remove iam:UpdateAssumeRolePolicy; require review for trust changes"},
+
+    {"id": "ESC-12", "name": "Login profile reset (password takeover)",
+     "requires": [["iam:UpdateLoginProfile", "iam:CreateLoginProfile"]],
+     "severity": "HIGH",
+     "remediation": "Restrict iam:*LoginProfile to self-service flows only"},
+
+    {"id": "ESC-13", "name": "Glue dev endpoint (RCE + role credentials)",
+     "requires": [["glue:CreateDevEndpoint"]],
+     "severity": "HIGH",
+     "remediation": "Remove glue:CreateDevEndpoint or confine to a sandbox account"},
 ]

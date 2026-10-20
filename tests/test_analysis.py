@@ -42,3 +42,49 @@ def test_blast_radius(inventory):
     items = blast_radius(g, "lambda-exec-role")
     labels = [i["label"] for i in items]
     assert "admin-role" in labels
+
+
+def test_can_pass_has_no_self_loop(inventory):
+    """A wildcard PassRole must not emit an identity -> itself can-pass edge."""
+    g = build_graph(inventory)
+    run_analysis(g, inventory)
+    self_loops = [(u, v) for u, v in g.edges() if u == v]
+    assert self_loops == []
+
+def _grant(inventory, identity_name, actions):
+    arn = f"arn:aws:iam::123456789012:policy/TestGrant{len(inventory['policies'])}"
+    inventory["policies"].append({
+        "name": f"TestGrant{len(inventory['policies'])}", "arn": arn,
+        "statements": [{"Effect": "Allow", "Action": actions, "Resource": "*"}],
+    })
+    for ident in inventory["identities"]:
+        if ident["name"] == identity_name:
+            ident.setdefault("attached_policies", []).append(arn)
+
+
+def _esc_types(inventory):
+    g = build_graph(inventory)
+    result = run_analysis(g, inventory)
+    return {(f["type"], f["identity"]) for f in result["findings"]}
+
+
+def test_update_assume_role_policy_escalation(inventory):
+    _grant(inventory, "readonly-auditor", ["iam:UpdateAssumeRolePolicy"])
+    assert ("ESC-11", "readonly-auditor") in _esc_types(inventory)
+
+
+def test_login_profile_escalation(inventory):
+    _grant(inventory, "readonly-auditor", ["iam:UpdateLoginProfile"])
+    assert ("ESC-12", "readonly-auditor") in _esc_types(inventory)
+
+
+def test_glue_dev_endpoint_escalation(inventory):
+    _grant(inventory, "readonly-auditor", ["glue:CreateDevEndpoint"])
+    assert ("ESC-13", "readonly-auditor") in _esc_types(inventory)
+
+
+def test_esc_rules_do_not_fire_without_permission(inventory):
+    types = _esc_types(inventory)
+    offenders = {(t, ident) for t, ident in types
+                 if t in {"ESC-11", "ESC-12", "ESC-13"} and ident != "admin-role"}
+    assert offenders == set()

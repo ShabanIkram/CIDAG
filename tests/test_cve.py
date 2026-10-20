@@ -67,3 +67,58 @@ def test_cve_severity_mapping():
               cvss3_vector="CVSS:3.1/AV:N", description="log4shell", published=None,
               last_modified=None, cpes=[], url="")
     assert cve.severity == "CRITICAL"
+
+
+def test_no_nvd_never_touches_network(tmp_path, monkeypatch):
+    """--no-nvd must never hit the API, even when the local mirror is warm.
+
+    Regression: engine.correlate() gated on `use_network or count() > 0`, so a
+    populated mirror re-entered _query_nvd() with use_network=False, and a cold
+    query_cache fell through to a live NVD request.
+    """
+    from cidag.cve.nvd import NVDClient
+
+    client = NVDClient(cache_path=tmp_path / "mirror.db")
+    client._upsert([CVE(cve_id="CVE-2020-0000", severity="HIGH", cvss3_score=8.0,
+                        cvss3_vector="", description="warm mirror", published=None,
+                        last_modified=None, cpes=[], url="")])
+    assert client.count() > 0  # the exact condition that reopened the gate
+
+    calls = {"http": 0}
+
+    def boom(*args, **kwargs):
+        calls["http"] += 1
+        raise AssertionError("offline mode hit the live NVD API")
+
+    monkeypatch.setattr(NVDClient, "_get", boom)
+
+    engine = CVEEngine(nvd=client, use_network=False, log=lambda m: None)
+    svc = DetectedService(product="unknown", vendor="unknown", version="1.0",
+                          port=1, banner="mystery service")
+    engine.correlate([svc])
+    assert calls["http"] == 0
+
+
+def test_seed_rules_respect_affected_from():
+    """Legacy versions must not report CVEs that never applied to them."""
+    def cves(product, version):
+        return {f.cve for f in _seed_matches(
+            DetectedService(product=product, vendor=product, version=version))}
+
+    assert "CVE-2021-41773" not in cves("apache http server", "2.2.8")
+    assert "CVE-2021-41773" in cves("apache http server", "2.4.49")
+    assert "CVE-2021-41773" not in cves("apache http server", "2.4.51")
+    assert "CVE-2016-0777" not in cves("openssh", "4.7p1")
+    assert "CVE-2016-0777" in cves("openssh", "5.9p1")
+    assert "CVE-2016-0777" not in cves("openssh", "8.2p1")
+
+
+def test_vsftpd_seed_only_exact_backdoored_version():
+    def cves(version):
+        return {f.cve for f in _seed_matches(
+            DetectedService(product="vsftpd", vendor="vsftpd", version=version))}
+
+    assert cves("2.3.4") == {"CVE-2011-2523"}
+    assert cves("2.3.3") == set()
+    # old rule used affected_below=3.0.3, reporting every version under 3.0.3
+    assert cves("3.0.0") == set()
