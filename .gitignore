@@ -25,6 +25,8 @@ data/*.json
 cidag/data/*.json
 !cidag/data/mock_aws.json
 !cidag/data/mock_scanners.json
+!cidag/data/mock_azure.json
+!cidag/data/mock_gcp.json
 *.pem
 credentials
 .env

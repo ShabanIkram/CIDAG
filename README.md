@@ -26,6 +26,9 @@ offline-first tool with a unified report.
   login-profile takeover, self-attachment, boundary manipulation, access-key
   theft, Glue endpoints), shortest paths to admin, blast radius, deny-aware
   evaluation
+- **Azure / GCP collectors** — Azure RBAC role assignments and GCP project IAM
+  bindings normalize into the same attack graph and policy engine (read-only;
+  optional SDK extras)
 - **IAM policy risk analysis** — Cloudsplaining-style least-privilege lens:
   wildcard-admin policies, privilege-escalation primitives, data-exfiltration
   capability, public trust principals (POL-001…POL-004)
@@ -50,6 +53,9 @@ offline-first tool with a unified report.
   assumes a role per member account, and tags every finding with its account
 - **Compliance mappings** — every check is mapped (best-effort) to CIS AWS
   Foundations and PCI DSS v4.0 controls, with per-framework report filtering
+- **Permission boundaries & SCP evaluation** — AWS permissions boundaries and
+  Organizations SCPs gate escalation rules, wildcard-admin detection, and
+  PassRole edges, so guardrail-blocked actions are not reported as exploitable
 - **Unified findings schema** — one `Finding` (severity/module/check/target/CVE/
   account/compliance/remediation) powers the CLI, reports, and graph renderers
 - **CI-ready outputs** — Markdown / JSON / CSV / **SARIF 2.1.0** (GitHub code
@@ -66,7 +72,24 @@ python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 pip install -e .                   # optional: installs `cidag` command
+pip install -e ".[azure]"          # Azure live collection
+pip install -e ".[gcp]"            # GCP live collection
 ```
+
+Live cloud access is read-only:
+
+- **AWS** — the credential chain (`AWS_PROFILE` / `--profile`); IAM/S3/EC2 read
+  APIs, plus `organizations:ListPoliciesForTarget` / `DescribePolicy` and
+  `iam:GetPolicy`/`GetPolicyVersion` when SCPs and boundaries exist (optional —
+  scans continue without them)
+- **Azure** — `Reader` at subscription scope; `DefaultAzureCredential`
+  (`AZURE_SUBSCRIPTION_ID` or `--subscription-id`, defaults to first enabled)
+- **GCP** — `resourcemanager.projects.getIamPolicy` + `iam.roles.get`;
+  `GOOGLE_CLOUD_PROJECT` / `--project`, Application Default Credentials
+
+Azure principal display names are resolved from RBAC only (object IDs), and
+Azure/GCP have no role-trust edges; AWS-only modules (`s3`, `ec2`, `inspector`,
+`sechub`) are rejected under `--cloud azure|gcp`.
 
 ## Usage
 
@@ -81,6 +104,13 @@ cidag graph --format svg -o graph.svg        # visual attack graph (open in any 
 cidag graph --format mermaid                 # mermaid flowchart (README / mermaid.live)
 cidag graph --format dot                     # graphviz source (render elsewhere)
 cidag paths --format mermaid                 # escalation chains as a flowchart
+
+# --- Multi-cloud IAM ---
+cidag scan --cloud azure --modules iam,policy   # offline Azure RBAC mock
+cidag scan --cloud gcp   --modules iam,policy   # offline GCP IAM mock
+cidag scan --cloud azure --live --subscription-id <sub>
+cidag scan --cloud gcp   --live --project <project-id>
+cidag graph --cloud gcp --format svg -o gcp.svg
 
 # --- Modular scanning ---
 cidag scan --modules iam,s3,ec2            # IAM + S3 + EC2/RDS/CloudTrail
@@ -229,7 +259,7 @@ CLI + Reports (md / json / csv / sarif) + graph renderers (svg / mermaid / dot)
 cidag/
 ├── core/            # unified Finding, scanner registry, ScanContext, scope guard
 ├── cve/             # NVD client + SQLite mirror, CPE matching, correlation engine
-├── collectors/      # mock + AWS data collection, Organizations/assume-role
+├── collectors/      # mock + AWS / Azure RBAC / GCP IAM, Organizations/assume-role
 ├── normalizer/      # policy evaluator
 ├── graph/           # NetworkX graph construction + svg / mermaid / dot renderers
 ├── analysis/        # escalation rules + attack path engine
@@ -239,6 +269,7 @@ cidag/
 │   ├── network/     # authorized port scan + banner grab
 │   ├── policy/      # IAM policy least-privilege / exposure analysis
 │   └── imports/     # Inspector, Security Hub, nmap/nuclei/Prowler + nuclei bridge
+├── normalizer/      # deny/boundary/SCP-aware effective-permission evaluator
 ├── reports/         # markdown / json / csv / sarif exporters + compliance maps
 ├── cli/             # command-line interface
 └── data/            # mock inventories for offline use
@@ -257,8 +288,7 @@ All tests run offline against bundled mocks — no AWS credentials or network ne
 
 ## Roadmap
 
-- [ ] Azure / GCP collectors
-- [ ] Permission boundaries & SCP evaluation
+- [ ] Azure deny assignments / GCP organization policy constraints
 - [ ] Non-destructive attack simulation (prove a chain with read-only calls)
 - [ ] UDP and service-detection scan modes
 - [ ] Expanded offline CVE seed coverage (beyond classic backdoored builds)

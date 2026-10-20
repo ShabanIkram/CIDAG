@@ -1,14 +1,16 @@
+import json
+
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-from .base import BaseCollector
+from .base import BaseCollector, CloudCollectionError, CloudCredentialsError
 
 
-class AwsCredentialsError(RuntimeError):
+class AwsCredentialsError(CloudCredentialsError):
     """Live collection requested but no AWS credentials resolve."""
 
 
-class AwsCollectionError(RuntimeError):
+class AwsCollectionError(CloudCollectionError):
     """A live AWS collector failed.
 
     Continuing with a partial/empty inventory would silently turn "we could not
@@ -60,6 +62,7 @@ class AwsCollector(BaseCollector):
         identities.extend(self._collect_roles(iam))
         identities.extend(self._collect_groups(iam))
         policies.extend(self._collect_policies(iam, identities))
+        self._collect_boundary_policies(iam, identities, policies)
 
         try:
             account_id = session.client("sts").get_caller_identity().get("Account", "unknown")
@@ -72,6 +75,7 @@ class AwsCollector(BaseCollector):
             "identities": identities,
             "policies": policies,
             "resources": [],
+            "scps": self._collect_scps(session, account_id),
         }
 
     def _collect_users(self, iam) -> list[dict]:
@@ -83,14 +87,18 @@ class AwsCollector(BaseCollector):
                 inline = [f"{u['Arn']}:inline/{p}" for p in
                           iam.list_user_policies(UserName=u["UserName"])["PolicyNames"]]
                 groups = iam.list_groups_for_user(UserName=u["UserName"])["Groups"]
-                out.append({
+                entry = {
                     "type": "user",
                     "name": u["UserName"],
                     "arn": u["Arn"],
                     "attached_policies": attached,
                     "inline_policies": inline,
                     "groups": [g["Arn"] for g in groups],
-                })
+                }
+                boundary = (u.get("PermissionsBoundary") or {}).get("PermissionsBoundaryArn")
+                if boundary:
+                    entry["boundary_policy"] = boundary
+                out.append(entry)
         except (ClientError, BotoCoreError) as e:
             print(f"[!] users: {e}")
         return out
@@ -104,14 +112,18 @@ class AwsCollector(BaseCollector):
                 trust = iam.get_role(RoleName=r["RoleName"])["Role"]["AssumeRolePolicyDocument"]
                 inline = [f"{r['Arn']}:inline/{p}" for p in
                           iam.list_role_policies(RoleName=r["RoleName"])["PolicyNames"]]
-                out.append({
+                entry = {
                     "type": "role",
                     "name": r["RoleName"],
                     "arn": r["Arn"],
                     "trust_policy": trust,
                     "attached_policies": attached,
                     "inline_policies": inline,
-                })
+                }
+                boundary = (r.get("PermissionsBoundary") or {}).get("PermissionsBoundaryArn")
+                if boundary:
+                    entry["boundary_policy"] = boundary
+                out.append(entry)
         except (ClientError, BotoCoreError) as e:
             print(f"[!] roles: {e}")
         return out
@@ -151,6 +163,69 @@ class AwsCollector(BaseCollector):
                 if data:
                     out.append(data)
         return out
+
+    def _collect_boundary_policies(self, iam, identities: list[dict],
+                                   policies: list[dict]) -> None:
+        """Fetch managed policies used as permissions boundaries."""
+        known = {p["arn"] for p in policies}
+        for ident in identities:
+            arn = ident.get("boundary_policy")
+            if not arn or arn in known:
+                continue
+            try:
+                policy = iam.get_policy(PolicyArn=arn)["Policy"]
+                doc = iam.get_policy_version(
+                    PolicyArn=arn,
+                    VersionId=policy["DefaultVersionId"])["PolicyVersion"]["Document"]
+                statements = doc.get("Statement", [])
+                if isinstance(statements, dict):
+                    statements = [statements]
+                policies.append({"arn": arn, "name": policy["PolicyName"],
+                                 "statements": statements})
+                known.add(arn)
+            except (ClientError, BotoCoreError) as e:
+                print(f"[!] boundary policy {arn}: {e}")
+
+    def _collect_scps(self, session, account_id: str) -> list[dict]:
+        """Collect SCPs attached to the account and its OU/root ancestors."""
+        if not account_id or account_id == "unknown":
+            return []
+        try:
+            org = session.client("organizations")
+            pending = [account_id]
+            seen_targets: set[str] = set()
+            seen_policies: set[str] = set()
+            scps: list[dict] = []
+            while pending:
+                target = pending.pop()
+                if target in seen_targets:
+                    continue
+                seen_targets.add(target)
+                for pol in _paginate(org, "list_policies_for_target", "Policies",
+                                     TargetId=target,
+                                     Filter="SERVICE_CONTROL_POLICY"):
+                    if pol["Id"] in seen_policies:
+                        continue
+                    seen_policies.add(pol["Id"])
+                    content = org.describe_policy(PolicyId=pol["Id"])["Policy"]["Content"]
+                    doc = json.loads(content) if isinstance(content, str) else content
+                    statements = doc.get("Statement", [])
+                    if isinstance(statements, dict):
+                        statements = [statements]
+                    scps.append({"arn": pol["Arn"], "name": pol["Name"],
+                                 "statements": statements})
+                for parent in org.list_parents(TargetId=target).get("Parents", []):
+                    pending.append(parent["Id"])
+            return scps
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code == "AWSOrganizationsNotInUseException":
+                return []
+            print(f"[!] scps: unavailable ({code or e}); SCP evaluation skipped")
+            return []
+        except BotoCoreError as e:
+            print(f"[!] scps: unavailable ({e}); SCP evaluation skipped")
+            return []
 
     def _get_inline_statement(self, iam, ident: dict, inline_arn: str):
         name = inline_arn.split("/")[-1]

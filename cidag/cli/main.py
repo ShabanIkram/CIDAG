@@ -10,7 +10,9 @@ from cidag.collectors.aws import (
     AwsCredentialsError,
     verify_credentials,
 )
-from cidag.collectors.base import MockCollector
+from cidag.collectors.azure import AzureCollector
+from cidag.collectors.base import CloudCollectionError, CloudCredentialsError, MockCollector
+from cidag.collectors.gcp import GcpCollector
 from cidag.core.finding import Finding, Severity
 from cidag.core.context import ScanContext
 from cidag.core.scope import ScopeGuard, OutOfScopeError
@@ -27,6 +29,7 @@ from cidag.core.registry import all_scanners, run_scanners
 
 SCANNER_MODULES = ("s3", "ec2", "net", "policy", "nuclei", "inspector", "sechub", "import")
 ALL_MODULES = ("iam",) + SCANNER_MODULES
+AWS_ONLY_MODULES = ("s3", "ec2", "inspector", "sechub")
 # modules that need AWS creds but no pre-collected inventory
 _LIVE_API_MODULES = ("inspector", "sechub")
 
@@ -70,6 +73,12 @@ def _modules(args) -> list[str]:
     for m in mods:
         if m not in ALL_MODULES:
             raise SystemExit(f"[!] unknown module {m!r}; choose from {', '.join(ALL_MODULES)}")
+    cloud = getattr(args, "cloud", "aws")
+    blocked = sorted(set(mods) & set(AWS_ONLY_MODULES)) if cloud != "aws" else []
+    if blocked:
+        raise SystemExit(
+            f"[!] module(s) {', '.join(blocked)} are AWS-only and cannot run "
+            f"with --cloud {cloud}; use iam/policy/net/nuclei/import")
     return mods
 
 
@@ -90,6 +99,9 @@ def _merge_scanner_mock(inv: dict) -> dict:
 
 def _get_inventory(args, modules: list[str] | None = None) -> dict:
     modules = modules or ["iam"]
+    cloud = getattr(args, "cloud", "aws")
+    if cloud != "aws":
+        return _get_cloud_inventory(args, cloud)
     live = getattr(args, "profile", None) or getattr(args, "live", False)
     if live:
         # Fail fast: an empty inventory from dead credentials must never be
@@ -103,10 +115,29 @@ def _get_inventory(args, modules: list[str] | None = None) -> dict:
             _log(f"[*] Saved Inventory -> {args.save}")
         return inv
     path = getattr(args, "input", None)
-    inv = MockCollector(path).collect()
+    inv = MockCollector(path, cloud=cloud).collect()
     if not path and any(m in modules for m in ("s3", "ec2")):
         inv = _merge_scanner_mock(inv)
     return inv
+
+
+def _get_cloud_inventory(args, cloud: str) -> dict:
+    """Azure/GCP inventory: live collectors or the bundled cloud mock."""
+    if getattr(args, "live", False):
+        if cloud == "azure":
+            _log("[*] Collecting Azure RBAC (read-only)...")
+            inv = AzureCollector(
+                subscription_id=getattr(args, "subscription_id", None),
+                region=args.region).collect()
+        else:
+            _log("[*] Collecting GCP project IAM (read-only)...")
+            inv = GcpCollector(project=getattr(args, "project", None),
+                               region=args.region).collect()
+        if getattr(args, "save", None):
+            Path(args.save).write_text(json.dumps(inv, indent=2, default=str))
+            _log(f"[*] Saved Inventory -> {args.save}")
+        return inv
+    return MockCollector(getattr(args, "input", None), cloud=cloud).collect()
 
 
 def _collect_live_scanners(args, inv: dict, modules: list[str], session=None) -> None:
@@ -265,6 +296,9 @@ def _run_org(args, modules: list[str]):
 def _run_unified(args, modules: list[str]):
     """Return (inventory, g, iam_result_or_None, findings[Finding])."""
     if getattr(args, "all_accounts", False):
+        if getattr(args, "cloud", "aws") != "aws":
+            raise CloudCollectionError(
+                "--all-accounts is AWS Organizations only; use --cloud aws")
         return _run_org(args, modules)
     inventory = _get_inventory(args, modules)
     g, iam_result, findings = _scan_inventory(args, inventory, modules)
@@ -398,14 +432,17 @@ def cmd_report(args):
     elif args.format == "sarif":
         content = to_sarif(findings)
     else:
-        if iam_result is None or getattr(args, "compliance", None):
-            # markdown for non-IAM modules / compliance-filtered reports
-            content = _md_findings(inventory, modules, findings)
-        else:
+        # Legacy markdown payload only for the original iam-only report; any
+        # scanner module or compliance filter uses the unified renderer so
+        # findings are never dropped from the report.
+        if iam_result is not None and all(m == "iam" for m in modules) \
+                and not getattr(args, "compliance", None):
             content = to_markdown(inventory, iam_result)
             extra = _compliance_md(findings)
             if extra:
                 content = content.rstrip() + "\n" + extra
+        else:
+            content = _md_findings(inventory, modules, findings)
     if args.output:
         Path(args.output).write_text(content)
         _log(f"[*] Report Written -> {args.output}")
@@ -516,7 +553,9 @@ def cmd_nvd(args):
 
 
 def _add_common(p):
-    p.add_argument("--input", "-i", help="Inventory JSON (default: built-in mock)")
+    p.add_argument("--input", "-i", help="Inventory JSON (default: built-in cloud mock)")
+    p.add_argument("--cloud", choices=["aws", "azure", "gcp"], default="aws",
+                   help="Cloud provider for mock/live inventory (default: aws)")
     p.add_argument("--profile", "-p", help="AWS profile")
     p.add_argument("--region", "-r", default="us-east-1")
     p.add_argument("--live", action="store_true", help="Use default AWS credentials")
@@ -526,6 +565,10 @@ def _add_common(p):
                    help="Role to assume in member accounts (default: %(default)s)")
     p.add_argument("--account-id", action="append", dest="account_ids", default=[],
                    help="Limit --all-accounts to an account id (repeatable)")
+    p.add_argument("--subscription-id",
+                   help="Azure subscription id (default: AZURE_SUBSCRIPTION_ID or first enabled)")
+    p.add_argument("--project",
+                   help="GCP project id (default: GOOGLE_CLOUD_PROJECT or credential default)")
     p.add_argument("--save", help="Save collected inventory to file")
 
 
@@ -602,7 +645,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (AwsCredentialsError, AwsCollectionError) as e:
+    except (CloudCredentialsError, CloudCollectionError) as e:
         # One catch point: every subcommand that touches AWS stops here
         # instead of reporting a plausible-looking but fabricated scan.
         print(f"[!] LIVE SCAN ABORTED: {e}", file=sys.stderr)

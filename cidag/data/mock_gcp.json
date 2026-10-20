@@ -1,0 +1,94 @@
+{
+  "cloud": "gcp",
+  "account_id": "cidag-demo",
+  "region": "us-central1",
+  "identities": [
+    {
+      "type": "user",
+      "name": "user:admin@example.com",
+      "arn": "user:admin@example.com",
+      "attached_policies": ["gcp:role:roles/owner"],
+      "inline_policies": [],
+      "groups": []
+    },
+    {
+      "type": "service_account",
+      "name": "serviceAccount:ci-deployer@cidag-demo.iam.gserviceaccount.com",
+      "arn": "serviceAccount:ci-deployer@cidag-demo.iam.gserviceaccount.com",
+      "attached_policies": ["gcp:role:projects/cidag-demo/roles/deployer"],
+      "inline_policies": [],
+      "groups": []
+    },
+    {
+      "type": "group",
+      "name": "group:security@example.com",
+      "arn": "group:security@example.com",
+      "attached_policies": ["gcp:role:roles/viewer"],
+      "inline_policies": [],
+      "groups": []
+    },
+    {
+      "type": "service_account",
+      "name": "serviceAccount:analytics@cidag-demo.iam.gserviceaccount.com",
+      "arn": "serviceAccount:analytics@cidag-demo.iam.gserviceaccount.com",
+      "attached_policies": ["gcp:role:projects/cidag-demo/roles/dataReader"],
+      "inline_policies": [],
+      "groups": []
+    }
+  ],
+  "policies": [
+    {
+      "arn": "gcp:role:roles/owner",
+      "name": "roles/owner",
+      "statements": [
+        {"Effect": "Allow", "Action": ["*"], "Resource": "*"}
+      ]
+    },
+    {
+      "arn": "gcp:role:projects/cidag-demo/roles/deployer",
+      "name": "projects/cidag-demo/roles/deployer",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "resourcemanager.projects.setIamPolicy",
+            "iam.serviceAccountKeys.create",
+            "iam.serviceAccounts.actAs"
+          ],
+          "Resource": "*"
+        }
+      ]
+    },
+    {
+      "arn": "gcp:role:roles/viewer",
+      "name": "roles/viewer",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "resourcemanager.projects.get",
+            "compute.instances.list",
+            "storage.objects.list"
+          ],
+          "Resource": "*"
+        }
+      ]
+    },
+    {
+      "arn": "gcp:role:projects/cidag-demo/roles/dataReader",
+      "name": "projects/cidag-demo/roles/dataReader",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "storage.objects.get",
+            "bigquery.tables.getData",
+            "secretmanager.versions.access"
+          ],
+          "Resource": "*"
+        }
+      ]
+    }
+  ],
+  "resources": []
+}

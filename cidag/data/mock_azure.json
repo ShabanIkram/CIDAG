@@ -1,0 +1,118 @@
+{
+  "cloud": "azure",
+  "account_id": "9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f",
+  "region": "eastus",
+  "identities": [
+    {
+      "type": "user",
+      "name": "ops@contoso.com",
+      "arn": "azure:9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f:principal:6a3f1c2e-ops",
+      "attached_policies": [
+        "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f/providers/Microsoft.Authorization/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+      ],
+      "inline_policies": [],
+      "groups": []
+    },
+    {
+      "type": "service_principal",
+      "name": "ci-deployer",
+      "arn": "azure:9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f:principal:b7e2d4c1-ci",
+      "attached_policies": [
+        "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c",
+        "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f/providers/Microsoft.Authorization/roleDefinitions/d2f1a3c4-cidag-deployer"
+      ],
+      "inline_policies": [],
+      "groups": []
+    },
+    {
+      "type": "group",
+      "name": "platform-admins",
+      "arn": "azure:9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f:principal:c4d5e6f7-admins",
+      "attached_policies": [
+        "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f/providers/Microsoft.Authorization/roleDefinitions/18d7d88d-d35e-4fb5-a5c3-7773c20a72d9"
+      ],
+      "inline_policies": [],
+      "groups": []
+    },
+    {
+      "type": "service_principal",
+      "name": "analytics-job",
+      "arn": "azure:9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f:principal:e8f9a0b1-analytics",
+      "attached_policies": [
+        "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f/providers/Microsoft.Authorization/roleDefinitions/f1a2b3c4-cidag-secretreader"
+      ],
+      "inline_policies": [],
+      "groups": []
+    }
+  ],
+  "policies": [
+    {
+      "arn": "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f/providers/Microsoft.Authorization/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635",
+      "name": "Owner",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": ["*"],
+          "Resource": "*"
+        }
+      ]
+    },
+    {
+      "arn": "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c",
+      "name": "Contributor",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "Microsoft.Compute/*",
+            "Microsoft.Storage/*",
+            "Microsoft.Network/*"
+          ],
+          "Resource": "*"
+        }
+      ]
+    },
+    {
+      "arn": "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f/providers/Microsoft.Authorization/roleDefinitions/d2f1a3c4-cidag-deployer",
+      "name": "CIDAG Deployer (custom)",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "Microsoft.Authorization/roleAssignments/write",
+            "Microsoft.Web/sites/write"
+          ],
+          "Resource": "*"
+        }
+      ]
+    },
+    {
+      "arn": "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f/providers/Microsoft.Authorization/roleDefinitions/18d7d88d-d35e-4fb5-a5c3-7773c20a72d9",
+      "name": "User Access Administrator",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "Microsoft.Authorization/*"
+          ],
+          "Resource": "*"
+        }
+      ]
+    },
+    {
+      "arn": "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f/providers/Microsoft.Authorization/roleDefinitions/f1a2b3c4-cidag-secretreader",
+      "name": "CIDAG Secret Reader (custom)",
+      "statements": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "Microsoft.KeyVault/vaults/secrets/getSecret/action",
+            "Microsoft.Storage/storageAccounts/listKeys/action"
+          ],
+          "Resource": "*"
+        }
+      ]
+    }
+  ],
+  "resources": []
+}

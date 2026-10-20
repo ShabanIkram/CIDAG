@@ -22,6 +22,12 @@ _DATA_EXFIL_ACTIONS = (
     "dynamodb:getitem", "dynamodb:query", "dynamodb:scan",
     "kms:decrypt",
     "rds:downloaddblogfileportion",
+    # Azure / GCP equivalents
+    "storage.objects.get",
+    "bigquery.tables.getdata",
+    "secretmanager.versions.access",
+    "microsoft.keyvault/vaults/secrets/getsecret/action",
+    "microsoft.storage/storageaccounts/listkeys/action",
 )
 
 _PRIVESC_ACTIONS = (
@@ -31,6 +37,15 @@ _PRIVESC_ACTIONS = (
     "iam:updateassumerolepolicy",
     "iam:createloginprofile", "iam:updateloginprofile",
     "iam:createaccesskey", "iam:passrole",
+    # Azure / GCP privilege-escalation primitives
+    "resourcemanager.projects.setiampolicy",
+    "resourcemanager.projects.setiampolicywithcond",
+    "iam.serviceaccounts.actas",
+    "iam.serviceaccountkeys.create",
+    "iam.serviceaccounts.implicitdelegation",
+    "iam.roles.update",
+    "microsoft.authorization/roleassignments/write",
+    "microsoft.authorization/roledefinitions/write",
 )
 
 
@@ -116,8 +131,9 @@ def _check_policy(policy: dict) -> list[Finding]:
             "POL-002", Severity.HIGH,
             f"Policy '{name}' grants privilege-escalation actions",
             arn,
-            "Remove IAM mutation permissions; scope PassRole to a single "
-            "non-privileged role and require permissions boundaries",
+            "Remove IAM/role-assignment mutation permissions; scope the "
+            "role to the smallest resource scope and require approval for "
+            "policy changes",
             {"policy": name, "actions": sorted(privesc)},
         ))
     if exfil:
