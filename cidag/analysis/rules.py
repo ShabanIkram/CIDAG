@@ -67,4 +67,14 @@ ESCALATION_RULES = [
      "requires": [["glue:CreateDevEndpoint"]],
      "severity": "HIGH",
      "remediation": "Remove glue:CreateDevEndpoint or confine to a sandbox account"},
+
+    {"id": "AZ-01", "name": "Azure role assignment write (Owner grant)",
+     "requires": [["Microsoft.Authorization/roleAssignments/write"]],
+     "severity": "CRITICAL",
+     "remediation": "Restrict roleAssignments/write to break-glass identities"},
+
+    {"id": "GCP-01", "name": "GCP setIamPolicy (Owner grant)",
+     "requires": [["resourcemanager.projects.setIamPolicy"]],
+     "severity": "CRITICAL",
+     "remediation": "Restrict setIamPolicy to project admins; use conditional grants"},
 ]

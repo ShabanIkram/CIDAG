@@ -65,11 +65,17 @@ def run_analysis(g: nx.DiGraph, inventory: dict) -> dict:
     _add_can_pass_edges(g, perms)
     admin_arns = [a for a, ep in perms.items() if ep.is_admin()]
 
+    # Cloud identities are not always IAM users/roles: Azure service
+    # principals and GCP service accounts can also escalate.
+    escalation_kinds = {
+        "user", "role", "group", "service_principal", "service_account",
+    }
     findings: list[dict] = []
     for ep in perms.values():
-        if ep.kind not in {"user", "role"}:
+        if ep.kind not in escalation_kinds:
             continue
-        findings.extend(ep.wildcard_findings())
+        if ep.kind in {"user", "role"}:
+            findings.extend(ep.wildcard_findings())
         if ep.is_admin():
             continue
         for rule in ESCALATION_RULES:

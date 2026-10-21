@@ -21,6 +21,7 @@ from cidag.graph.viz import to_dot, to_mermaid, to_mermaid_paths, to_svg
 from cidag.reports.compliance import attach as attach_compliance
 from cidag.reports.compliance import filter_by as filter_compliance
 from cidag.reports.compliance import summary as compliance_summary
+from cidag.execution.guard import ExploitError
 from cidag.reports.exporter import to_csv, to_json, to_markdown, to_sarif
 
 # Register every bundled scanner.
@@ -552,6 +553,181 @@ def cmd_nvd(args):
     client.close()
 
 
+def _exploit_session(args):
+    from cidag.execution.session import (AzureEngagementSession,
+                                         EngagementSession,
+                                         GcpEngagementSession)
+    cloud = getattr(args, "cloud", "aws")
+    if cloud == "azure":
+        if not args.subscription_id:
+            raise ExploitError("--cloud azure requires --subscription-id")
+        return AzureEngagementSession(args.subscription_id)
+    if cloud == "gcp":
+        if not args.project:
+            raise ExploitError("--cloud gcp requires --project")
+        return GcpEngagementSession(args.project, member=args.member)
+    return EngagementSession(profile=args.profile, region=args.region)
+
+
+def _exploit_guard(args, session):
+    from cidag.execution.guard import AuthorizationGuard
+    accounts = [args.authorize_exploitation] if args.authorize_exploitation else []
+    return AuthorizationGuard(
+        session, accounts,
+        assume_yes=getattr(args, "yes_i_have_written_authorization", False),
+        accept_unknown=getattr(args, "accept_unknown", False))
+
+
+def _exploit_params(args):
+    names = ("admin_policy_arn", "target_policy", "policy_version",
+             "boundary_arn", "target_group", "target_role", "pass_role",
+             "member", "scope", "principal_id")
+    return {name: getattr(args, name) for name in names
+            if getattr(args, name, None)}
+
+
+def _exploit_runner(args):
+    from cidag.execution.findings import load_report
+    from cidag.execution.runner import ExploitRunner
+    session = _exploit_session(args)
+    findings = None
+    if getattr(args, "from_report", None):
+        findings = load_report(args.from_report)
+    return ExploitRunner(
+        session, _exploit_guard(args, session),
+        audit_root=getattr(args, "audit_dir", ".cidag/engagements"),
+        keep=getattr(args, "keep", False), demo=getattr(args, "demo", False),
+        findings=findings,
+        allow_unproven=getattr(args, "allow_unproven", False))
+
+
+def cmd_exploit(args):
+    command = args.exploit_command
+    if command == "list":
+        from cidag.execution.runner import list_techniques
+        techniques = list_techniques()
+        if args.json:
+            print(json.dumps(techniques, indent=2))
+            return 0
+        for t in techniques:
+            required = ", ".join(t["required"]) or "none"
+            suffix = "" if t["executable"] else "  [plan-only]"
+            cloud = "" if t.get("provider", "aws") == "aws" else f"  [{t['provider']}]"
+            print(f"{t['id']}  {t['name']}{cloud}{suffix}\n"
+                  f"        {t['description']}\n"
+                  f"        required args: {required}")
+        return 0
+
+    if command == "plan":
+        plan = _exploit_runner(args).plan(args.technique, _exploit_params(args))
+        print(json.dumps(plan, indent=2))
+        return 0
+
+    if command == "run":
+        result = _exploit_runner(args).run(
+            args.technique, _exploit_params(args), canary=args.canary)
+        print(json.dumps(result.__dict__, indent=2))
+        return 0
+
+    if command == "canary":
+        if getattr(args, "cloud", "aws") != "aws":
+            raise ExploitError("canary checks are AWS-only")
+        from cidag.execution.canary import run_canary
+        from cidag.execution.context import ExploitContext
+        session = _exploit_session(args)
+        guard = _exploit_guard(args, session)
+        identity = guard.authorize()
+        guard.confirm(f"create and delete an impact canary in {identity['account']}")
+        evidence = run_canary(ExploitContext(session, identity), args.canary_service)
+        print(json.dumps(evidence, indent=2))
+        return 0 if evidence.get("status") == "verified" else 1
+
+    if command == "detections":
+        from cidag.execution.detections import detection_for, render_markdown
+        if args.technique:
+            try:
+                body = render_markdown([detection_for(args.technique)])
+            except KeyError:
+                raise ExploitError(
+                    f"unknown technique {args.technique!r}; run "
+                    f"'cidag exploit list'") from None
+        else:
+            body = render_markdown()
+        if args.output:
+            Path(args.output).write_text(body, encoding="utf-8")
+            _log(f"Wrote {args.output}")
+        else:
+            print(body)
+        return 0
+
+    if command == "report":
+        from cidag.execution.report import write_report
+        try:
+            path = write_report(args.manifest, args.output, mask=args.mask)
+        except (OSError, ValueError) as e:
+            raise ExploitError(f"could not read manifest: {e}") from e
+        _log(f"Wrote {path}")
+        return 0
+
+    if command == "demo":
+        from cidag.execution.report import demo_report
+        try:
+            path = demo_report(args.root, args.output)
+        except (OSError, ValueError) as e:
+            raise ExploitError(str(e)) from e
+        _log(f"Wrote {path}")
+        return 0
+
+    if command == "cleanup":
+        from cidag.execution.cleanup import apply_cleanups
+        from cidag.execution.guard import GuardError
+        from cidag.execution.report import load_manifest
+        try:
+            manifest = load_manifest(args.manifest)
+        except (OSError, ValueError) as e:
+            raise ExploitError(f"could not read manifest: {e}") from e
+        if manifest.get("provider", "aws") != "aws":
+            raise ExploitError(
+                f"cleanup is AWS-only; {manifest.get('provider')} runs always "
+                "roll back automatically")
+        session = _exploit_session(args)
+        guard = _exploit_guard(args, session)
+        identity = guard.authorize()
+        if str(identity["account"]) != str(manifest.get("account")):
+            raise GuardError(
+                f"caller account {identity['account']} does not match manifest "
+                f"account {manifest.get('account')}; refusing cleanup")
+        if manifest.get("status") in {"rolled-back", "aborted"}:
+            raise ExploitError(
+                f"manifest status is {manifest.get('status')!r}; no artifacts "
+                f"should remain (inspect the report or audit log first)")
+        entries = [a.get("cleanup") for a in manifest.get("artifacts", [])
+                   if a.get("cleanup")]
+        guard.confirm(f"apply {len(entries)} cleanup operations in "
+                      f"{identity['account']}")
+        results = apply_cleanups(session, entries)
+        print(json.dumps(results, indent=2))
+        return 0 if all(r.get("ok") for r in results) else 1
+
+    if command == "pacu":
+        if getattr(args, "cloud", "aws") != "aws":
+            raise ExploitError("Pacu is AWS-only")
+        from cidag.execution.pacu_bridge import PacuBridge
+        session = _exploit_session(args)
+        guard = _exploit_guard(args, session)
+        identity = guard.authorize()
+        guard.confirm(f"run Pacu module {args.module} in session "
+                      f"{args.pacu_session} against {identity['account']}")
+        result = PacuBridge().run_module(
+            args.pacu_session, args.module, args.module_args or "",
+            expected_account=identity["account"])
+        print(json.dumps(result, indent=2))
+        return 0
+
+    raise ExploitError(f"unknown exploit command {command}")
+
+
+
 def _add_common(p):
     p.add_argument("--input", "-i", help="Inventory JSON (default: built-in cloud mock)")
     p.add_argument("--cloud", choices=["aws", "azure", "gcp"], default="aws",
@@ -642,6 +818,95 @@ def main(argv=None):
     p_count = nvd_sub.add_parser("count", help="Show local NVD mirror size")
     p_count.set_defaults(func=cmd_nvd)
 
+    p_exploit = sub.add_parser(
+        "exploit", help="Authorized escalation execution, canaries, detections")
+    ex = p_exploit.add_subparsers(dest="exploit_command", required=True)
+
+    def _auth_flags(p, targets=False):
+        p.add_argument("--authorize-exploitation", metavar="ACCOUNT_ID",
+                       help="Account/subscription/project id you may test")
+        p.add_argument("--cloud", choices=["aws", "azure", "gcp"], default="aws",
+                       help="Execution target cloud (default: aws)")
+        p.add_argument("--profile", "-p", help="AWS profile")
+        p.add_argument("--region", "-r", default="us-east-1")
+        p.add_argument("--subscription-id", help="Azure subscription id")
+        p.add_argument("--project", help="GCP project id")
+        p.add_argument("--member", help="GCP member to grant (user:/serviceAccount:)")
+        p.add_argument("--principal-id", help="Azure principal object id override")
+        p.add_argument("--scope", help="Azure scope (default: subscription)")
+        p.add_argument("--yes-i-have-written-authorization", action="store_true",
+                       help="Skip the TTY confirmation phrase (unattended demo)")
+        p.add_argument("--accept-unknown", action="store_true",
+                       help="Proceed when IAM policy simulation has no decision")
+        if targets:
+            p.add_argument("--admin-policy-arn",
+                           help="Managed admin policy ARN (default: AdministratorAccess)")
+            p.add_argument("--target-policy", help="Target policy ARN (ESC-04/ESC-08)")
+            p.add_argument("--policy-version", help="Policy version id (ESC-08)")
+            p.add_argument("--boundary-arn", help="Replacement permissions boundary (ESC-09)")
+            p.add_argument("--target-group", help="Privileged IAM group (ESC-10)")
+            p.add_argument("--target-role", help="Target role name or ARN (ESC-11)")
+            p.add_argument("--pass-role", help="Admin role ARN for the Lambda probe (ESC-02)")
+
+    p_list = ex.add_parser("list", help="List executable techniques")
+    p_list.add_argument("--json", action="store_true")
+    p_list.set_defaults(func=cmd_exploit)
+
+    p_plan = ex.add_parser("plan", help="Dry-run authorization, simulation, and actions")
+    p_plan.add_argument("technique")
+    _auth_flags(p_plan, targets=True)
+    p_plan.add_argument("--from-report",
+                        help="CIDAG JSON/SARIF report to check for the finding")
+    p_plan.set_defaults(func=cmd_exploit)
+
+    p_run = ex.add_parser("run", help="Execute one technique with rollback")
+    p_run.add_argument("technique")
+    _auth_flags(p_run, targets=True)
+    p_run.add_argument("--from-report",
+                       help="CIDAG JSON/SARIF report that contains the finding")
+    p_run.add_argument("--allow-unproven", action="store_true",
+                       help="Run without a matching scan finding (explicit override)")
+    p_run.add_argument("--keep", action="store_true",
+                       help="Leave artifacts in place and print cleanup manifest")
+    p_run.add_argument("--canary", choices=["auto", "s3", "secretsmanager"],
+                       help="Prove impact with a self-deleting canary")
+    p_run.add_argument("--audit-dir", default=".cidag/engagements")
+    p_run.set_defaults(func=cmd_exploit)
+
+    p_canary = ex.add_parser("canary", help="Create, read, and delete an impact canary")
+    _auth_flags(p_canary)
+    p_canary.add_argument("--canary-service", choices=["auto", "s3", "secretsmanager"],
+                          default="auto")
+    p_canary.set_defaults(func=cmd_exploit)
+
+    p_det = ex.add_parser("detections", help="Emit Sigma/Insights/EventBridge detections")
+    p_det.add_argument("--technique", help="Limit to one technique id")
+    p_det.add_argument("--output", "-o")
+    p_det.set_defaults(func=cmd_exploit)
+
+    p_report = ex.add_parser("report", help="Render a markdown evidence pack")
+    p_report.add_argument("manifest", help="Path to manifest.json")
+    p_report.add_argument("--output", "-o")
+    p_report.add_argument("--mask", action="store_true", help="Mask account ids")
+    p_report.set_defaults(func=cmd_exploit)
+
+    p_demo = ex.add_parser("demo", help="Build a masked portfolio report from history")
+    p_demo.add_argument("--root", default=".cidag/engagements")
+    p_demo.add_argument("--output", "-o", default="cidag-demo.md")
+    p_demo.set_defaults(func=cmd_exploit)
+
+    p_cleanup = ex.add_parser("cleanup", help="Apply a manifest's cleanup operations")
+    p_cleanup.add_argument("manifest")
+    _auth_flags(p_cleanup)
+    p_cleanup.set_defaults(func=cmd_exploit)
+
+    p_pacu = ex.add_parser("pacu", help="Run an allowlisted module in an existing Pacu session")
+    _auth_flags(p_pacu)
+    p_pacu.add_argument("--pacu-session", required=True)
+    p_pacu.add_argument("--module", required=True)
+    p_pacu.add_argument("--module-args", default="")
+    p_pacu.set_defaults(func=cmd_exploit)
+
     args = parser.parse_args(argv)
     try:
         return args.func(args)
@@ -649,6 +914,9 @@ def main(argv=None):
         # One catch point: every subcommand that touches AWS stops here
         # instead of reporting a plausible-looking but fabricated scan.
         print(f"[!] LIVE SCAN ABORTED: {e}", file=sys.stderr)
+        return 2
+    except ExploitError as e:
+        print(f"[!] EXPLOIT ABORTED: {e}", file=sys.stderr)
         return 2
 
 

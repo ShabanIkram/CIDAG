@@ -61,6 +61,13 @@ offline-first tool with a unified report.
 - **CI-ready outputs** — Markdown / JSON / CSV / **SARIF 2.1.0** (GitHub code
   scanning) plus `cidag diff` to track new, fixed, and severity-changed findings
   between any two reports
+- **Authorized exploitation engine (opt-in)** — execute the escalation CIDAG
+  proved, with an explicit account authorization gate, IAM policy-simulator
+  preflight, verification, automatic rollback, hashed-only canary impact proof,
+  and matching detections (ESC-* on AWS, AZ-01/GCP-01 on Azure/GCP)
+- **Pacu orchestration bridge** — run allowlisted read-only Pacu modules inside
+  an existing Pacu session; CIDAG never imports Pacu keys, shell-interpolates, or
+  accepts arbitrary modules
 - **Offline-first** — works on built-in mock data; no cloud account or network needed
 
 ## Install
@@ -74,6 +81,8 @@ pip install -r requirements.txt
 pip install -e .                   # optional: installs `cidag` command
 pip install -e ".[azure]"          # Azure live collection
 pip install -e ".[gcp]"            # GCP live collection
+# Pacu bridge (optional, only if you already run Pacu):
+# pipx install git+https://github.com/RhinoSecurityLabs/pacu
 ```
 
 Live cloud access is read-only:
@@ -125,6 +134,27 @@ cidag scan --modules nuclei --targets 10.0.0.0/24 --allow-private
 cidag scan --live --all-accounts --modules iam,s3,ec2
 cidag scan --live --all-accounts --account-id 111122223333 --role-name AuditRole
 
+# --- Authorized exploitation (opt-in; sandbox accounts only) ---
+cidag exploit list
+cidag exploit plan ESC-05 --authorize-exploitation 123456789012
+cidag exploit run  ESC-05 --authorize-exploitation 123456789012 --canary auto
+cidag exploit run  ESC-11 --authorize-exploitation 123456789012 \
+                   --target-role sandbox-admin --keep
+cidag exploit report .cidag/engagements/<run>/manifest.json
+cidag exploit detections -o detections.md
+cidag exploit cleanup .cidag/engagements/<run>/manifest.json \
+                   --authorize-exploitation 123456789012
+cidag exploit pacu --authorize-exploitation 123456789012 \
+                   --pacu-session demo --module iam__enum_permissions
+cidag exploit demo -o cidag-demo.md
+
+# --- Azure / GCP authorized execution (rollback only) ---
+cidag exploit run AZ-01 --cloud azure --subscription-id <sub-id> \
+                   --authorize-exploitation <sub-id>
+cidag exploit run GCP-01 --cloud gcp --project <project-id> \
+                   --authorize-exploitation <project-id> \
+                   --member user:analyst@example.com
+
 # --- Reports and CI ---
 cidag report -m iam,s3,ec2 --format md   -o report.md
 cidag report -m iam,s3,ec2 --format sarif -o cidag.sarif   # GitHub code scanning
@@ -156,6 +186,32 @@ cidag report --modules iam,s3,ec2 --format csv -o findings.csv
 ```
 
 Without installing, prefix commands with `python -m cidag.cli.main`.
+
+### Authorized exploitation model
+
+`cidag exploit` is the only mutating surface and every run requires
+`--authorize-exploitation <account-id|subscription-id|project-id>`.
+Before a single mutation:
+
+1. The caller identity must resolve to that exact account, subscription, or
+   project (AWS STS, Azure token claims, or the supplied GCP member).
+2. On AWS, IAM `SimulatePrincipalPolicy` must show every required action
+   allowed (override a missing decision with `--accept-unknown`, never a deny).
+   Azure/GCP have no equivalent simulator, so preflight is marked skipped and
+   read-only post-execution verification is mandatory.
+3. In a TTY, the operator types `EXECUTE <account-id>`; unattended runs need
+   `--yes-i-have-written-authorization`.
+4. One technique runs, read-only verification proves the result, an optional
+   canary is created/read/deleted (AWS), and rollback restores the account by
+   default. `--keep` and post-run cleanup are AWS-only; Azure/GCP always roll
+   back automatically.
+
+Every run writes `.cidag/engagements/<timestamp>-<account>/` with a redacted
+`audit.jsonl`, cleanup `manifest.json`, and evidence. Secrets are never written;
+the canary stores only a SHA-256 digest. `--keep` leaves artifacts in place and
+`cidag exploit cleanup <manifest>` applies the allowlisted restoration ops.
+The engine does **not** install persistence, harvest credentials, exfiltrate
+data, or add evasion. Use dedicated sandbox credentials and written authorization.
 
 ### Network authorization model
 
@@ -232,6 +288,8 @@ Set an `NVD_API_KEY` (free from NVD) to raise the rate limit from 5→50 req/30s
 | ESC-08 | iam:SetDefaultPolicyVersion | HIGH |
 | ESC-09 | Permission boundary manipulation | HIGH |
 | ESC-10 | iam:AddUserToGroup | HIGH |
+| AZ-01 | Azure roleAssignments/write (Owner grant) | CRITICAL |
+| GCP-01 | GCP resourcemanager.projects.setIamPolicy (Owner grant) | CRITICAL |
 | — | Graph attack path to admin | HIGH |
 
 ## Architecture
@@ -251,6 +309,9 @@ Scanner registry (s3 / ec2 / net / policy / nuclei / inspector / sechub / import
 CVE engine (NVD mirror + CPE matching + seed rules)
         ↓
 CLI + Reports (md / json / csv / sarif) + graph renderers (svg / mermaid / dot)
+        +
+Execution layer (opt-in): authorization gate → simulator preflight →
+technique → verify → canary → rollback/audit → detection + evidence pack
 ```
 
 ## Project Structure
@@ -270,6 +331,8 @@ cidag/
 │   ├── policy/      # IAM policy least-privilege / exposure analysis
 │   └── imports/     # Inspector, Security Hub, nmap/nuclei/Prowler + nuclei bridge
 ├── normalizer/      # deny/boundary/SCP-aware effective-permission evaluator
+├── execution/       # opt-in escalation: guard, techniques, runner, canary,
+│                    # audit/cleanup, Pacu bridge, detections, evidence reports
 ├── reports/         # markdown / json / csv / sarif exporters + compliance maps
 ├── cli/             # command-line interface
 └── data/            # mock inventories for offline use
@@ -284,12 +347,15 @@ pytest -q
 pytest --cov=cidag          # coverage report
 ```
 
-All tests run offline against bundled mocks — no AWS credentials or network needed.
+All tests run offline against bundled mocks — no cloud credentials or network needed.
 
 ## Roadmap
 
+- [x] Authorized escalation execution with simulator preflight, canary proof,
+      rollback, audit manifest, and matching detection content
+- [x] Azure / GCP authorized execution parity (AZ-01 Owner grant, GCP-01 roles/owner)
+- [ ] Multi-step chain execution (currently one technique per authorized run)
 - [ ] Azure deny assignments / GCP organization policy constraints
-- [ ] Non-destructive attack simulation (prove a chain with read-only calls)
 - [ ] UDP and service-detection scan modes
 - [ ] Expanded offline CVE seed coverage (beyond classic backdoored builds)
 
@@ -298,7 +364,8 @@ All tests run offline against bundled mocks — no AWS credentials or network ne
 CIDAG is for **authorized security testing only**. Scan only accounts, networks,
 and ranges you own or have explicit written permission to assess. Misuse may
 violate laws (CFAA, Computer Misuse Act, and equivalents). The network scanner
-enforces an explicit allowlist for this reason.
+enforces an explicit allowlist and the execution engine requires an explicit
+account id, identity check, simulator preflight, and confirmation for this reason.
 
 ## License
 

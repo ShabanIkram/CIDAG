@@ -41,6 +41,7 @@ def to_sarif(findings: list, repo_uri: str = "https://github.com/ShabanIkram/CID
                 "severity": severity,
                 **({"cve": f.cve} if f.cve else {}),
                 **({"account": f.account} if f.account else {}),
+                **({"identityArn": f.identity_arn} if f.identity_arn else {}),
                 **({"compliance": f.compliance} if f.compliance else {}),
                 **({"remediation": f.remediation} if f.remediation else {}),
             },

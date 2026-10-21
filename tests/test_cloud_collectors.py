@@ -114,3 +114,16 @@ def test_cloud_mock_report(capsys):
     out = capsys.readouterr().out
     assert "cidag-demo" in out
     assert "POL-001" in out
+
+
+def test_cloud_service_principals_get_escalation_findings():
+    from cidag.analysis.engine import run_analysis
+    from cidag.graph.builder import build_graph
+
+    azure = run_analysis(build_graph(inv := MockCollector(cloud="azure").collect()), inv)
+    az = [f for f in azure["findings"] if f["type"] == "AZ-01"]
+    assert any(f["identity"] == "ci-deployer" for f in az)
+
+    gcp = run_analysis(build_graph(inv := MockCollector(cloud="gcp").collect()), inv)
+    gcp_findings = [f for f in gcp["findings"] if f["type"] == "GCP-01"]
+    assert any("ci-deployer@" in f["identity_arn"] for f in gcp_findings)

@@ -30,6 +30,7 @@ cidag/data/*.json
 *.pem
 credentials
 .env
+.cidag/
 
 # Local NVD CVE mirror (large, regenerated via `cidag nvd sync`)
 *.sqlite3
