@@ -59,6 +59,8 @@ class AuditLog:
             "version": 1,
             "tool": "cidag",
             "technique": technique,
+            "chain": None,
+            "steps": [],
             "account": str(account),
             "session_arn": str(session_arn),
             "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

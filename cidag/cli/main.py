@@ -629,6 +629,15 @@ def cmd_exploit(args):
         print(json.dumps(result.__dict__, indent=2))
         return 0
 
+    if command == "chain":
+        from cidag.execution.chains import parse_chain
+        steps = parse_chain(args.steps)
+        result = _exploit_runner(args).run_chain(
+            steps, _exploit_params(args), canary=args.canary,
+            chain_name=args.name)
+        print(json.dumps(result.__dict__, indent=2))
+        return 0
+
     if command == "canary":
         if getattr(args, "cloud", "aws") != "aws":
             raise ExploitError("canary checks are AWS-only")
@@ -852,8 +861,11 @@ def main(argv=None):
     p_list.add_argument("--json", action="store_true")
     p_list.set_defaults(func=cmd_exploit)
 
-    p_plan = ex.add_parser("plan", help="Dry-run authorization, simulation, and actions")
-    p_plan.add_argument("technique")
+    p_plan = ex.add_parser(
+        "plan",
+        help="Dry-run authorization, simulation, and actions (accepts a "
+             "comma-separated chain)")
+    p_plan.add_argument("technique", help="Technique id or chain, e.g. ESC-04,ESC-08")
     _auth_flags(p_plan, targets=True)
     p_plan.add_argument("--from-report",
                         help="CIDAG JSON/SARIF report to check for the finding")
@@ -872,6 +884,24 @@ def main(argv=None):
                        help="Prove impact with a self-deleting canary")
     p_run.add_argument("--audit-dir", default=".cidag/engagements")
     p_run.set_defaults(func=cmd_exploit)
+
+    p_chain = ex.add_parser(
+        "chain",
+        help="Execute an ordered multi-step chain with all-or-nothing rollback")
+    p_chain.add_argument("steps",
+                         help="Comma-separated technique ids, e.g. ESC-04,ESC-08")
+    _auth_flags(p_chain, targets=True)
+    p_chain.add_argument("--name", help="Chain label for the audit manifest")
+    p_chain.add_argument("--from-report",
+                         help="CIDAG JSON/SARIF report that contains the findings")
+    p_chain.add_argument("--allow-unproven", action="store_true",
+                         help="Run steps without matching scan findings")
+    p_chain.add_argument("--keep", action="store_true",
+                         help="Leave artifacts in place (AWS only)")
+    p_chain.add_argument("--canary", choices=["auto", "s3", "secretsmanager"],
+                         help="Prove impact after every step succeeded")
+    p_chain.add_argument("--audit-dir", default=".cidag/engagements")
+    p_chain.set_defaults(func=cmd_exploit)
 
     p_canary = ex.add_parser("canary", help="Create, read, and delete an impact canary")
     _auth_flags(p_canary)

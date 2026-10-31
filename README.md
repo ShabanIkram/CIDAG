@@ -62,9 +62,10 @@ offline-first tool with a unified report.
   scanning) plus `cidag diff` to track new, fixed, and severity-changed findings
   between any two reports
 - **Authorized exploitation engine (opt-in)** — execute the escalation CIDAG
-  proved, with an explicit account authorization gate, IAM policy-simulator
-  preflight, verification, automatic rollback, hashed-only canary impact proof,
-  and matching detections (ESC-* on AWS, AZ-01/GCP-01 on Azure/GCP)
+  proved (single steps or ordered chains), with an explicit account authorization
+  gate, IAM policy-simulator preflight, verification, automatic rollback,
+  hashed-only canary impact proof, and matching detections (ESC-* on AWS,
+  AZ-01/GCP-01 on Azure/GCP)
 - **Pacu orchestration bridge** — run allowlisted read-only Pacu modules inside
   an existing Pacu session; CIDAG never imports Pacu keys, shell-interpolates, or
   accepts arbitrary modules
@@ -138,6 +139,8 @@ cidag scan --live --all-accounts --account-id 111122223333 --role-name AuditRole
 cidag exploit list
 cidag exploit plan ESC-05 --authorize-exploitation 123456789012
 cidag exploit run  ESC-05 --authorize-exploitation 123456789012 --canary auto
+cidag exploit chain ESC-04,ESC-08 --authorize-exploitation 123456789012 \
+                   --target-policy <admin-policy-arn> --policy-version v2
 cidag exploit run  ESC-11 --authorize-exploitation 123456789012 \
                    --target-role sandbox-admin --keep
 cidag exploit report .cidag/engagements/<run>/manifest.json
@@ -201,10 +204,12 @@ Before a single mutation:
    read-only post-execution verification is mandatory.
 3. In a TTY, the operator types `EXECUTE <account-id>`; unattended runs need
    `--yes-i-have-written-authorization`.
-4. One technique runs, read-only verification proves the result, an optional
-   canary is created/read/deleted (AWS), and rollback restores the account by
-   default. `--keep` and post-run cleanup are AWS-only; Azure/GCP always roll
-   back automatically.
+4. One technique or an ordered chain runs, read-only verification proves each
+   result, an optional canary is created/read/deleted (AWS), and rollback
+   restores the account by default. Chains plan every step first, stop at the
+   first failure, and roll back all executed steps in reverse order.
+   `--keep` and post-run cleanup are AWS-only; Azure/GCP always roll back
+   automatically.
 
 Every run writes `.cidag/engagements/<timestamp>-<account>/` with a redacted
 `audit.jsonl`, cleanup `manifest.json`, and evidence. Secrets are never written;
@@ -354,7 +359,7 @@ All tests run offline against bundled mocks — no cloud credentials or network 
 - [x] Authorized escalation execution with simulator preflight, canary proof,
       rollback, audit manifest, and matching detection content
 - [x] Azure / GCP authorized execution parity (AZ-01 Owner grant, GCP-01 roles/owner)
-- [ ] Multi-step chain execution (currently one technique per authorized run)
+- [x] Multi-step chain execution (ordered chains, all-or-nothing reverse rollback)
 - [ ] Azure deny assignments / GCP organization policy constraints
 - [ ] UDP and service-detection scan modes
 - [ ] Expanded offline CVE seed coverage (beyond classic backdoored builds)

@@ -33,11 +33,24 @@ def _cleanup_lines(artifacts: list[dict]) -> list[str]:
 def render_report(manifest: dict, audit_dir: str | Path, mask: bool = False) -> str:
     audit_dir = Path(audit_dir)
     done = lambda value: mask_account(value) if mask else str(value)
+    steps = manifest.get("steps") or []
+    chain = manifest.get("chain") or {}
+    if steps:
+        chain_label = chain.get("name") or manifest.get("technique")
+        step_line = " -> ".join(f"`{s.get('technique')}`" for s in steps)
+        scope_lines = [
+            f"- **Chain:** `{chain_label}`",
+            f"- **Steps:** {step_line}",
+        ]
+    else:
+        scope_lines = [
+            f"- **Technique:** `{manifest.get('technique')}` "
+            f"({TECHNIQUES.get(str(manifest.get('technique')), None).name
+               if str(manifest.get('technique')) in TECHNIQUES else 'unknown'})",
+        ]
     lines = [
         "# CIDAG Authorized Exploitation Report", "",
-        f"- **Technique:** `{manifest.get('technique')}` "
-        f"({TECHNIQUES.get(str(manifest.get('technique')), None).name
-           if str(manifest.get('technique')) in TECHNIQUES else 'unknown'})",
+        *scope_lines,
         f"- **Cloud:** `{manifest.get('provider', 'aws')}`",
         f"- **Account:** `{done(manifest.get('account', ''))}`",
         f"- **Caller:** `{done(manifest.get('session_arn', ''))}`",
@@ -49,7 +62,13 @@ def render_report(manifest: dict, audit_dir: str | Path, mask: bool = False) -> 
         "## Finding linkage", "",
     ]
     linkage = manifest.get("finding_evidence")
-    if linkage:
+    if linkage and linkage.get("steps"):
+        lines.append(f"- **Status:** `{linkage.get('status')}`")
+        for step_id, ev in (linkage.get("steps") or {}).items():
+            lines.append(f"- **{step_id}:** `{(ev or {}).get('status')}`"
+                         + (f" (source: `{(ev or {}).get('source')}`)"
+                            if (ev or {}).get("source") else ""))
+    elif linkage:
         lines += [
             f"- **Status:** `{linkage.get('status')}`",
             f"- **Source:** `{linkage.get('source')}`",
@@ -63,10 +82,16 @@ def render_report(manifest: dict, audit_dir: str | Path, mask: bool = False) -> 
             lines.append(f"- **Reason:** {linkage['reason']}")
     else:
         lines.append("- No finding evidence recorded.")
-    lines += ["", "## Preflight", "",
-        "```json", json.dumps(manifest.get("preflight", {}), indent=2), "```", "",
-        "## Executed actions", "",
-    ]
+    if steps:
+        lines += ["", "## Preflight", ""]
+        for step in steps:
+            lines += [f"### {step.get('technique')}", "```json",
+                      json.dumps(step.get("preflight", {}), indent=2), "```", ""]
+    else:
+        lines += ["", "## Preflight", "",
+                  "```json",
+                  json.dumps(manifest.get("preflight", {}), indent=2), "```", ""]
+    lines += ["## Executed actions", ""]
     actions = manifest.get("actions") or []
     lines += [f"{i}. {a}" for i, a in enumerate(actions, 1)] or ["- None"]
     lines += ["", "## Verification", "", "```json",
@@ -94,10 +119,16 @@ def render_report(manifest: dict, audit_dir: str | Path, mask: bool = False) -> 
     notes = manifest.get("notes") or []
     if notes:
         lines += ["", "## Notes", ""] + [f"- {n}" for n in notes]
+    if steps:
+        detection_ids = [s.get("technique") for s in steps
+                         if s.get("technique") in TECHNIQUES]
+    elif manifest.get("technique") in TECHNIQUES:
+        detection_ids = [manifest.get("technique")]
+    else:
+        detection_ids = []
     lines += ["", "## Detection coverage", "",
-              detections_markdown([detection_for(manifest.get("technique"))])
-              if manifest.get("technique") in TECHNIQUES else
-              "No detection mapping.", ""]
+              detections_markdown([detection_for(t) for t in detection_ids])
+              if detection_ids else "No detection mapping.", ""]
     body = "\n".join(lines)
     return mask_account(body) if mask else body
 

@@ -865,3 +865,101 @@ def test_azure_scope_cannot_leave_authorized_subscription(tmp_path):
     with pytest.raises(ExploitError, match="authorized subscription"):
         runner.plan("AZ-01", {"scope": "/subscriptions/other-sub"})
     assert session.azure.role_assignments.methods == []
+
+
+def test_chain_plan_is_read_only(tmp_path):
+    session = FakeSession()
+    iam = session.aws.client("iam")
+    iam.responses["simulate_principal_policy"] = _allow_simulation
+    iam.responses["get_policy"] = {
+        "Policy": {"Arn": ADMIN_POLICY, "DefaultVersionId": "v1"}}
+    plan = _runner(session, tmp_path).plan(
+        "ESC-04,ESC-08", {"target_policy": ADMIN_POLICY, "policy_version": "v2"})
+    assert plan["chain"] is True
+    assert [s["technique"] for s in plan["steps"]] == ["ESC-04", "ESC-08"]
+    assert plan["actions"][0].startswith("ESC-04:")
+    assert all(m in {"simulate_principal_policy", "get_policy"}
+               for m in session.aws.methods())
+
+
+def test_chain_run_executes_steps_and_rolls_back_in_reverse(tmp_path):
+    session = FakeSession()
+    iam = session.aws.client("iam")
+    iam.responses["simulate_principal_policy"] = _allow_simulation
+    iam.responses["get_policy"] = {
+        "Policy": {"Arn": ADMIN_POLICY, "DefaultVersionId": "v1"}}
+    iam.responses["create_policy_version"] = {"PolicyVersion": {"VersionId": "v2"}}
+    result = _runner(session, tmp_path).run_chain(
+        ["ESC-04", "ESC-08"],
+        {"target_policy": ADMIN_POLICY, "policy_version": "v2"},
+        chain_name="admin-policy")
+    assert result.status == "rolled-back"
+    assert result.technique == "admin-policy"
+    versions = [k["VersionId"] for _, m, k in session.aws.recorder
+                if m == "set_default_policy_version"]
+    assert versions == ["v2", "v2", "v1", "v1"]
+    methods = session.aws.methods()
+    assert methods.index("create_policy_version") < methods.index("delete_policy_version")
+    assert methods[-1] == "delete_policy_version"
+    manifest = json.loads(Path(result.manifest_path).read_text())
+    assert manifest["chain"]["steps"] == ["ESC-04", "ESC-08"]
+    assert [s["status"] for s in manifest["steps"]] == ["succeeded", "succeeded"]
+    assert set(manifest["verification"]["steps"]) == {"ESC-04", "ESC-08"}
+
+
+def test_chain_failure_midway_rolls_back_completed_steps(tmp_path):
+    session = FakeSession()
+    iam = session.aws.client("iam")
+    iam.responses["simulate_principal_policy"] = _allow_simulation
+    iam.responses["get_policy"] = {
+        "Policy": {"Arn": ADMIN_POLICY, "DefaultVersionId": "v1"}}
+    iam.responses["create_policy_version"] = {"PolicyVersion": {"VersionId": "v2"}}
+
+    def fail_attach(kwargs):
+        raise RuntimeError("attach denied")
+
+    iam.responses["attach_role_policy"] = fail_attach
+    with pytest.raises(ExploitError, match="chain failed at ESC-05"):
+        _runner(session, tmp_path).run_chain(["ESC-04", "ESC-05"], {
+            "target_policy": ADMIN_POLICY,
+            "admin_policy_arn": ADMIN_POLICY})
+    methods = session.aws.methods()
+    assert "create_policy_version" in methods
+    assert "delete_policy_version" in methods
+    assert methods.index("delete_policy_version") > methods.index(
+        "create_policy_version")
+    audits = sorted(Path(tmp_path).glob("*/manifest.json"))
+    manifest = json.loads(audits[-1].read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["steps"][0]["status"] == "succeeded"
+    assert manifest["steps"][1]["status"] == "failed"
+
+
+def test_chain_rejects_duplicates_and_plan_only_steps(tmp_path):
+    from cidag.execution.chains import parse_chain
+    with pytest.raises(ExploitError, match="duplicate"):
+        parse_chain("ESC-05,ESC-05")
+    with pytest.raises(ExploitError, match="at least two"):
+        parse_chain("ESC-05")
+    runner = _runner(FakeSession(), tmp_path)
+    with pytest.raises(ExploitError, match="plan-only"):
+        runner.plan("ESC-01,ESC-05")
+
+
+def test_chain_report_lists_steps_and_detections(tmp_path):
+    from cidag.execution.report import write_report
+    session = FakeSession()
+    iam = session.aws.client("iam")
+    iam.responses["simulate_principal_policy"] = _allow_simulation
+    iam.responses["get_policy"] = {
+        "Policy": {"Arn": ADMIN_POLICY, "DefaultVersionId": "v1"}}
+    iam.responses["create_policy_version"] = {"PolicyVersion": {"VersionId": "v2"}}
+    result = _runner(session, tmp_path).run_chain(
+        ["ESC-04", "ESC-08"],
+        {"target_policy": ADMIN_POLICY, "policy_version": "v2"})
+    out = write_report(result.manifest_path, tmp_path / "chain-report.md")
+    body = Path(out).read_text()
+    assert "- **Chain:**" in body
+    assert "`ESC-04` -> `ESC-08`" in body
+    assert "ESC-04 - IAM policy version made administrator-equivalent" in body
+    assert "ESC-08 - IAM policy default version switched" in body

@@ -8,6 +8,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from .audit import AuditLog, redact
 from .canary import run_canary
+from .chains import is_chain, parse_chain
 from .context import ExploitContext
 from .findings import evidence_for
 from .guard import ExploitError, GuardError
@@ -80,6 +81,8 @@ class ExploitRunner:
             raise ExploitError(f"{tech.id} requires {flags}")
 
     def plan(self, technique_id: str, params: dict | None = None) -> dict:
+        if is_chain(technique_id):
+            return self.plan_chain(parse_chain(technique_id), params)
         key = str(technique_id).upper()
         if key in PLAN_ONLY:
             return plan_payload(PLAN_ONLY[key])
@@ -109,6 +112,45 @@ class ExploitRunner:
             "finding_evidence": evidence,
             "actions": [a.label for a in actions],
             "required": list(tech.required),
+        }
+
+    def plan_chain(self, steps: list[str], params: dict | None = None) -> dict:
+        techs = [self._technique(s) for s in steps]
+        identity = self.guard.authorize()
+        params = dict(params or {})
+        planned: list[dict] = []
+        for tech in techs:
+            self._check_required(tech, params)
+            ctx = ExploitContext(self.session, identity, params)
+            resources = tech.resources(ctx) if tech.resources else None
+            preflight = self.guard.simulate(actions_for(tech, ctx), resources)
+            try:
+                actions = tech.plan(ctx)
+            except (ClientError, BotoCoreError) as e:
+                raise ExploitError(f"could not plan {tech.id}: {e}") from e
+            except Exception as e:
+                raise ExploitError(f"could not plan {tech.id}: {e}") from e
+            evidence = (evidence_for(self.findings, tech.id, identity,
+                                     self.allow_unproven)
+                        if self.findings is not None or self.allow_unproven
+                        else {"status": "not-checked"})
+            planned.append({
+                "technique": tech.id,
+                "name": tech.name,
+                "preflight": preflight,
+                "finding_evidence": evidence,
+                "actions": [a.label for a in actions],
+                "required": list(tech.required),
+            })
+        label = " + ".join(t.id for t in techs)
+        return {
+            "chain": True,
+            "technique": label,
+            "account": str(identity["account"]),
+            "caller_arn": identity["arn"],
+            "steps": planned,
+            "actions": [f"{s['technique']}: {a}"
+                        for s in planned for a in s["actions"]],
         }
 
     def run(self, technique_id: str, params: dict | None = None,
@@ -198,6 +240,140 @@ class ExploitRunner:
         path = audit.save(status)
         return RunResult(tech.id, status, evidence, canary_evidence, path,
                          str(audit.dir))
+
+    def run_chain(self, steps: list[str], params: dict | None = None,
+                  canary: str | None = None, chain_name: str | None = None) -> RunResult:
+        techs = [self._technique(s) for s in steps]
+        if len(techs) < 2:
+            raise ExploitError("a chain needs at least two techniques")
+        if canary and self.provider != "aws":
+            raise ExploitError("--canary is AWS-only")
+        if self.keep and self.provider != "aws":
+            raise ExploitError(
+                "--keep/cleanup is AWS-only; rollback is mandatory for "
+                f"{self.provider} sessions")
+        identity = self.guard.authorize()
+        params = dict(params or {})
+        for tech in techs:
+            self._check_required(tech, params)
+            if self.keep and tech.id in {"ESC-07", "ESC-12"}:
+                raise ExploitError(
+                    f"{tech.id} issues a credential whose secret is never "
+                    f"written; use a verified chain with rollback instead of "
+                    f"--keep")
+        evidence_map = {tech.id: evidence_for(self.findings, tech.id, identity,
+                                              self.allow_unproven)
+                        for tech in techs}
+        label = chain_name or " + ".join(t.id for t in techs)
+        audit = AuditLog(self.audit_root, identity["account"], identity["arn"],
+                         label)
+        audit.manifest["demo"] = self.demo
+        audit.manifest["provider"] = self.provider
+        audit.manifest["chain"] = {"name": label,
+                                   "steps": [t.id for t in techs]}
+        audit.manifest["steps"] = [{
+            "technique": t.id,
+            "name": t.name,
+            "status": "pending",
+            "preflight": {},
+            "finding_evidence": evidence_map[t.id],
+            "actions": [],
+            "verification": {},
+        } for t in techs]
+        audit.manifest["finding_evidence"] = {
+            "status": "per-step",
+            "steps": {tid: ev for tid, ev in evidence_map.items()}}
+
+        planned = []
+        last_ctx = None
+        try:
+            for tech in techs:
+                ctx = ExploitContext(self.session, identity, params, audit)
+                last_ctx = ctx
+                resources = tech.resources(ctx) if tech.resources else None
+                preflight = self.guard.simulate(actions_for(tech, ctx),
+                                                resources)
+                actions = tech.plan(ctx)
+                planned.append((tech, ctx, actions))
+                audit.manifest["steps"][len(planned) - 1].update({
+                    "preflight": preflight,
+                    "actions": [a.label for a in actions],
+                })
+                audit.event("chain-step-planned", technique=tech.id,
+                            actions=[a.label for a in actions],
+                            preflight=preflight)
+            audit.flush()
+            self.guard.confirm(
+                f"chain {label} ({len(techs)} steps) in account "
+                f"{identity['account']} as {identity['arn']}")
+        except GuardError as e:
+            audit.note(str(e))
+            audit.save("aborted")
+            raise
+        except ExploitError as e:
+            audit.note(str(e))
+            audit.save("failed")
+            raise
+        except Exception as e:
+            audit.note(f"planning failed: {e}")
+            audit.save("failed")
+            raise ExploitError(f"chain planning failed: {e}") from e
+
+        executed = []
+        verifications: dict[str, dict] = {}
+        canary_evidence = None
+        current = None
+        try:
+            for index, (tech, ctx, actions) in enumerate(planned, 1):
+                current = tech
+                step = audit.manifest["steps"][index - 1]
+                step["status"] = "running"
+                audit.event("chain-step-start", technique=tech.id, step=index)
+                for action in actions:
+                    executed.append(action)
+                    result = action.run()
+                    audit.action_result(f"{tech.id}: {action.label}", True,
+                                        json.dumps(redact(result), default=str))
+                    if action.cleanup:
+                        kind, identifier = action.artifact() if action.artifact \
+                            else ("action", action.label)
+                        audit.artifact(kind, identifier, action.cleanup())
+                        audit.flush()
+                evidence = tech.verify(ctx) if self.verify \
+                    else {"status": "skipped"}
+                verifications[tech.id] = evidence
+                step["verification"] = evidence
+                step["status"] = "succeeded"
+                audit.event("chain-step-verified", technique=tech.id,
+                            evidence=evidence)
+            audit.manifest["verification"] = {"steps": verifications}
+            if canary:
+                canary_evidence = run_canary(last_ctx, canary)
+                audit.canary(canary_evidence)
+                if canary_evidence.get("status") != "verified":
+                    audit.note(
+                        f"canary {canary_evidence.get('status')}: "
+                        f"{canary_evidence.get('attempts', '')}")
+            status = "succeeded-kept" if self.keep else "succeeded"
+        except Exception as e:
+            if current is not None:
+                for step in audit.manifest["steps"]:
+                    if step["technique"] == current.id \
+                            and step["status"] == "running":
+                        step["status"] = "failed"
+            audit.event("failure", error=str(e),
+                        technique=current.id if current else None)
+            self._rollback(executed, audit)
+            audit.save("failed")
+            where = f" at {current.id}" if current else ""
+            raise ExploitError(f"chain failed{where}: {e}") from e
+
+        if not self.keep:
+            clean = self._rollback(executed, audit)
+            status = "rolled-back" if clean else "rollback-incomplete"
+        path = audit.save(status)
+        return RunResult(label, status, {"steps": verifications},
+                         canary_evidence, path, str(audit.dir))
 
     @staticmethod
     def _rollback(executed, audit: AuditLog) -> bool:
