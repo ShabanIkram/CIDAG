@@ -1,8 +1,9 @@
 """Network scanner module.
 
-Performs an asyncio TCP connect scan of authorized targets, grabs service
-banners, fingerprints product/version, and correlates them against the NVD
-mirror via :class:`cidag.cve.engine.CVEEngine`.
+Performs an asyncio TCP connect scan of authorized targets and, depending on
+``--scan-mode``, active service-detection probes and UDP probes. Banners and
+probe responses are fingerprinted into product/version and correlated against
+the NVD mirror via :class:`cidag.cve.engine.CVEEngine`.
 
 Authorization is non-negotiable: every target IP must be inside the
 ``ScopeGuard`` allowlist, checked *before* any socket is opened.
@@ -11,8 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import re
-import ssl
 from typing import Iterable
 
 from ...core.context import ScanContext
@@ -20,6 +19,7 @@ from ...core.finding import Finding, Severity
 from ...core.registry import register
 from ...core.scope import OutOfScopeError
 from ...cve import CVEEngine, DetectedService, NVDClient
+from .probes import DEFAULT_UDP_PORTS, parse_banner, probe_tcp, udp_scan
 
 # A compact default of the most common/impactful ports (full range via --ports).
 DEFAULT_PORTS = [
@@ -28,50 +28,15 @@ DEFAULT_PORTS = [
     6379, 8080, 8443, 9200, 11211, 27017,
 ]
 
+SCAN_MODES = ("connect", "service", "udp", "all")
+
 _BANNER_TIMEOUT = 4.0
 _CONNECT_TIMEOUT = 1.2
 
-# product fingerprinting from banners
-_BANNER_PATTERNS: list[tuple[re.Pattern, str, str]] = [
-    (re.compile(r"OpenSSH[_/](?P<v>[\d.p]+)", re.I), "openssh", "openbsd"),
-    (re.compile(r"ProFTPD (?P<v>[\d.a-z]+)", re.I), "proftpd", "proftpd"),
-    (re.compile(r"vsftpd (?P<v>[\d.]+)", re.I), "vsftpd", "vsftpd"),
-    (re.compile(r"Apache/(?P<v>[\d.]+)", re.I), "apache http server", "apache"),
-    (re.compile(r"nginx/?(?P<v>[\d.]+)", re.I), "nginx", "nginx"),
-    (re.compile(r"Microsoft-IIS/(?P<v>[\d.]+)", re.I), "microsoft iis", "microsoft"),
-    (re.compile(r"Redis server v=(?P<v>[\d.]+)", re.I), "redis", "redis"),
-    (re.compile(r"220 (?P<v>[\d.]+)\s*FileZilla", re.I), "filezilla server", "filezilla"),
-    (re.compile(r"220.*ProFTPD", re.I), "proftpd", "proftpd"),
-    (re.compile(r"SIP/2.0", re.I), "asterisk", "asterisk"),
-    (re.compile(r"MySQL", re.I), "mysql", "oracle"),
-    (re.compile(r"PostgreSQL", re.I), "postgresql", "postgresql"),
-]
-
-
-def _parse_banner(banner: str, port: int) -> DetectedService | None:
-    for pattern, product, vendor in _BANNER_PATTERNS:
-        m = pattern.search(banner)
-        if m:
-            version = ""
-            try:
-                version = m.groupdict().get("v", "") or ""
-            except (IndexError, AttributeError):
-                version = ""
-            return DetectedService(product=product, vendor=vendor, version=version,
-                                   port=port, banner=banner)
-    # HTTP header fallback
-    if banner.lower().startswith("http/") or re.search(r"server:", banner, re.I):
-        server = ""
-        m = re.search(r"server:\s*([^\r\n]+)", banner, re.I)
-        if m:
-            server = m.group(1).strip()
-            vm = re.search(r"([\d][\d.]+)", server)
-            product = re.split(r"[/\s]", server)[0].lower() or "http"
-            return DetectedService(product=product, vendor="", version=vm.group(1) if vm else "",
-                                   port=port, banner=banner)
-    if banner:
-        return DetectedService(product="unknown", version="", port=port, banner=banner)
-    return None
+_TCP_HIGH_PORTS = {21, 22, 23, 445, 3389}
+_TCP_INFO_PORTS = {80, 443, 8080, 8443}
+_UDP_HIGH_PORTS = {69, 161, 162}
+_UDP_MEDIUM_PORTS = {137, 138}
 
 
 async def _grab_banner(host: str, port: int) -> str:
@@ -117,7 +82,8 @@ async def _scan_host(host: str, ports: Iterable[int], sem: asyncio.Semaphore) ->
             except Exception:
                 pass
             banner = await _grab_banner(host, port)
-            open_ports.append({"host": host, "port": port, "banner": banner})
+            open_ports.append({"host": host, "port": port, "proto": "tcp",
+                               "banner": banner})
 
     await asyncio.gather(*(probe(p) for p in ports))
     return open_ports
@@ -155,13 +121,18 @@ def _expand_targets(cidrs: Iterable[str], max_hosts: int, allow_private: bool,
 @register("net")
 class NetworkScanner:
     name = "net"
-    description = "Authorized network port scan + banner grab + CVE correlation"
+    description = ("Authorized network scan: TCP/UDP ports, active service "
+                   "detection, CVE correlation")
 
     def run(self, context: ScanContext) -> list[Finding]:
         targets: list[str] = list(context.opt("targets", []) or [])
         if not targets:
             context.log("    net: no --targets provided; skipping")
             return []
+        mode = str(context.opt("scan_mode", "connect") or "connect").lower()
+        if mode not in SCAN_MODES:
+            context.log(f"    net: unknown scan mode {mode!r}; using connect")
+            mode = "connect"
         allow_private = bool(context.scope.allow_private)
         max_hosts = int(context.opt("max_hosts", 1024))
         # Expand the authorized CIDR allowlist into concrete hosts, then
@@ -177,21 +148,41 @@ class NetworkScanner:
         for ip in hosts:
             context.scope.assert_in_scope(ip)
 
-        ports = list(context.opt("ports", DEFAULT_PORTS) or DEFAULT_PORTS)
         concurrency = int(context.opt("concurrency", 256))
-
-        context.log(f"    net: scanning {len(hosts)} host(s) x {len(ports)} ports")
-
-        sem = asyncio.Semaphore(concurrency)
-        results = asyncio.run(self._run_async(hosts, ports, sem, log=context.log))
-
         findings: list[Finding] = []
         services: list[DetectedService] = []
-        for r in results:
-            findings.extend(self._open_port_finding(r))
-            svc = _parse_banner(r["banner"], r["port"])
-            if svc:
-                services.append(svc)
+
+        if mode in ("connect", "service", "all"):
+            ports = list(context.opt("ports", DEFAULT_PORTS) or DEFAULT_PORTS)
+            context.log(f"    net: tcp {len(hosts)} host(s) x {len(ports)} ports "
+                        f"[mode={mode}]")
+            results = asyncio.run(self._run_async(hosts, ports,
+                                                  asyncio.Semaphore(concurrency),
+                                                  log=context.log))
+            for r, svc in self._identify(results, concurrency, mode, context.log):
+                findings.extend(self._open_port_finding(r))
+                if svc and svc.product != "unknown":
+                    services.append(svc)
+                    if mode in ("service", "all"):
+                        findings.append(self._service_finding(r, svc))
+            if not results:
+                context.log("    net: no open tcp ports found - if unexpected, check the "
+                            "target is up (ping) and reachable from this host")
+
+        if mode in ("udp", "all"):
+            udp_ports = list(context.opt("udp_ports", DEFAULT_UDP_PORTS)
+                             or DEFAULT_UDP_PORTS)
+            context.log(f"    net: udp {len(hosts)} host(s) x {len(udp_ports)} ports")
+            udp_results = asyncio.run(udp_scan(hosts, udp_ports,
+                                               asyncio.Semaphore(concurrency)))
+            for r in udp_results:
+                findings.extend(self._open_port_finding(r))
+                svc = r.get("service")
+                if svc and svc.product != "unknown":
+                    services.append(svc)
+                    findings.append(self._service_finding(r, svc))
+            if not udp_results:
+                context.log("    net: no udp responses (silent = open|filtered, not reported)")
 
         # Correlate detected services against NVD mirror. Offline seeds always
         # run; live NVD queries are gated by --no-nvd / offline mode.
@@ -209,11 +200,36 @@ class NetworkScanner:
             except Exception as e:
                 context.log(f"    net: CVE correlation skipped ({e})")
 
-        context.log(f"    net: {len(results)} open ports -> {len(findings)} findings")
-        if not results:
-            context.log("    net: no open ports found - if unexpected, check the target "
-                        "is up (ping) and reachable from this host")
+        context.log(f"    net: {len(findings)} findings")
         return findings
+
+    def _identify(self, results: list[dict], concurrency: int, mode: str,
+                  log) -> list[tuple[dict, DetectedService | None]]:
+        """Pair open ports with a detected service (active probes in service mode)."""
+        if mode not in ("service", "all"):
+            return [(r, parse_banner(r["banner"], r["port"], r.get("proto", "tcp")))
+                    for r in results]
+        return asyncio.run(self._identify_async(results, concurrency, log))
+
+    async def _identify_async(self, results: list[dict], concurrency: int,
+                              log) -> list[tuple[dict, DetectedService | None]]:
+        sem = asyncio.Semaphore(concurrency)
+
+        async def one(r: dict):
+            banner_svc = parse_banner(r["banner"], r["port"], r.get("proto", "tcp"))
+            if banner_svc and banner_svc.version:
+                return r, banner_svc
+            try:
+                async with sem:
+                    detected = await probe_tcp(r["host"], r["port"])
+            except Exception as e:
+                if log is not None:
+                    log(f"    net: probe {r['host']}:{r['port']} failed: {e!r}")
+                detected = None
+            return r, detected or banner_svc
+
+        pairs = await asyncio.gather(*(one(r) for r in results))
+        return list(pairs)
 
     async def _run_async(self, targets, ports, sem, log=None) -> list[dict]:
         tasks = [_scan_host(t, ports, sem) for t in targets]
@@ -226,20 +242,45 @@ class NetworkScanner:
                 log(f"    net: host scan failed: {item!r}")
         return out
 
+    def _port_severity(self, proto: str, port: int) -> Severity:
+        if proto == "udp":
+            if port in _UDP_HIGH_PORTS:
+                return Severity.HIGH
+            if port in _UDP_MEDIUM_PORTS:
+                return Severity.MEDIUM
+            return Severity.LOW
+        if port in _TCP_HIGH_PORTS:
+            return Severity.HIGH
+        if port in _TCP_INFO_PORTS:
+            return Severity.INFO
+        return Severity.LOW
+
     def _open_port_finding(self, r: dict) -> list[Finding]:
-        port = r["port"]
-        if port in (22, 3389, 21, 23, 445):
-            sev = Severity.HIGH
-        elif port in (80, 443, 8080, 8443):
-            sev = Severity.INFO
-        else:
-            sev = Severity.LOW
-        if sev == Severity.INFO and not r["banner"]:
+        port = int(r["port"])
+        proto = r.get("proto", "tcp")
+        sev = self._port_severity(proto, port)
+        banner = r.get("banner", "")
+        if sev == Severity.INFO and not banner:
             return []
+        target = f"{r['host']}:{port}" + ("/udp" if proto == "udp" else "")
         return [Finding(
             module="net", check_id="NET-OPEN", severity=sev,
-            title=f"Open port {port}/tcp on {r['host']}",
-            target=f"{r['host']}:{port}",
+            title=f"Open port {port}/{proto} on {r['host']}",
+            target=target,
             remediation="Confirm the service is required; restrict exposure via security group/firewall.",
-            evidence={"port": port, "banner": r["banner"][:300]},
+            evidence={"port": port, "proto": proto, "banner": banner[:300]},
         )]
+
+    def _service_finding(self, r: dict, svc: DetectedService) -> Finding:
+        proto = r.get("proto", "tcp")
+        label = f"{svc.product} {svc.version}".strip()
+        target = f"{r['host']}:{r['port']}" + ("/udp" if proto == "udp" else "")
+        return Finding(
+            module="net", check_id="NET-SERVICE", severity=Severity.INFO,
+            title=f"Service identified: {label} on {r['host']}:{r['port']}/{proto}",
+            target=target,
+            remediation="Confirm the service/version is required and patch to the latest release.",
+            evidence={"product": svc.product, "vendor": svc.vendor,
+                      "version": svc.version, "port": svc.port, "proto": proto,
+                      "banner": svc.banner[:300]},
+        )

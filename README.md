@@ -42,12 +42,17 @@ offline-first tool with a unified report.
 - **EC2 / RDS / CloudTrail scanner** — internet-open SSH/RDP/DB ports, all-traffic
   SGs, unencrypted EBS, IMDSv1, public/unencrypted RDS, short backups, CloudTrail
   misconfigs (EC2-*/RDS-*/CT-*)
-- **Network scanner** — authorized asyncio port scan + banner grab + service
-  fingerprinting (scope-guard enforced; private targets need `--allow-private`)
+- **Network scanner** — authorized asyncio TCP/UDP scan with
+  `--scan-mode {connect,service,udp,all}`: connect mode grabs banners, service
+  mode runs read-only protocol probes (HTTP, TLS, Redis, memcached, MySQL,
+  PostgreSQL, Elasticsearch, Docker), and UDP mode reports only hosts that
+  actually answer (DNS, NTP, SNMP, SSDP, mDNS). Scope-guard enforced; private
+  targets need `--allow-private`.
 - **CVE correlation engine** — fingerprints detected services and matches them
   against the **full NVD** (API 2.0 + local SQLite mirror). `cidag nvd sync`
-  builds an offline mirror; every scan then works offline. Includes curated seed
-  rules (Log4Shell-era classics) for a cold cache.
+  builds an offline mirror; every scan then works offline. Includes 36 curated,
+  version-bounded seed rules (web servers, SSH, TLS, FTP, mail, databases,
+  Tomcat/GitLab, Samba, Docker) for a cold cache.
 - **AWS-native CVE imports** — pull real CVE findings from **Inspector v2** and
   **Security Hub** (read-only)
 - **External tool imports** — ingest existing **nmap XML**, **nuclei JSON**, and
@@ -172,6 +177,10 @@ cidag diff --before old.json --after new.json               # new/fixed/changed
 # Network scan needs an explicit authorized CIDR; private ranges need the flag:
 cidag scan --modules net --targets 203.0.113.0/24           # public range
 cidag scan --modules net --targets 10.0.0.0/24 --allow-private --ports 22,80,443
+cidag scan --modules net --targets 10.0.0.0/24 --allow-private \
+           --scan-mode service                             # active probes -> CVEs
+cidag scan --modules net --targets 10.0.0.0/24 --allow-private \
+           --scan-mode all --udp-ports 53,123,161          # TCP + UDP
 
 # --- CVE correlation (every CVE, via NVD) ---
 cidag nvd sync --days 120          # build/refresh the offline NVD mirror
@@ -260,7 +269,7 @@ Network scanning is dual-use, so CIDAG makes authorization explicit and enforced
 | `policy` | Policy least-privilege / exposure analysis (POL-001…POL-004) | mock / AWS IAM |
 | `s3` | Bucket config checks (S3-001…S3-010) | mock / AWS S3 |
 | `ec2` | SG / EBS / IMDS / RDS / CloudTrail (EC2-*, RDS-*, CT-*) | mock / AWS |
-| `net` | Port scan + banner + CVE correlation | live (authorized) |
+| `net` | TCP/UDP scan, active service detection + CVE correlation | live (authorized) |
 | `nuclei` | Live nuclei run (binary auto-detected) | live (authorized) |
 | `cve` | NVD service→CVE correlation (used by `net`) | NVD mirror |
 | `inspector` | Import CVEs from AWS Inspector v2 | AWS API |
@@ -277,8 +286,9 @@ CIDAG does **not** hardcode CVEs — that's impossible (290k+ and growing). Inst
 2. **AWS Inspector / Security Hub** — import real CVEs AWS already found in your
    workloads.
 3. **nuclei / nmap / Prowler imports** — fold in CVEs from tools you already run.
-4. **Curated seed rules** — a handful of famous CVEs (Log4Shell, ProFTPD, vsftpd
-   backdoor…) so the engine is useful on a cold cache with no network.
+4. **Curated seed rules** — 36 version-bounded rules (34 CVEs) across web servers, SSH,
+   TLS, FTP, mail, databases, application servers, Samba, and Docker so the
+   engine is useful on a cold cache with no network.
 
 Set an `NVD_API_KEY` (free from NVD) to raise the rate limit from 5→50 req/30s.
 
@@ -366,8 +376,8 @@ All tests run offline against bundled mocks — no cloud credentials or network 
 - [x] Azure / GCP authorized execution parity (AZ-01 Owner grant, GCP-01 roles/owner)
 - [x] Multi-step chain execution (ordered chains, all-or-nothing reverse rollback)
 - [x] Azure deny assignments / GCP organization policy constraints
-- [ ] UDP and service-detection scan modes
-- [ ] Expanded offline CVE seed coverage (beyond classic backdoored builds)
+- [x] UDP and service-detection scan modes
+- [x] Expanded offline CVE seed coverage (beyond classic backdoored builds)
 
 ## Disclaimer
 

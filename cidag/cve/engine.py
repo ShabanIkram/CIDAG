@@ -15,11 +15,10 @@ cold cache and no network.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from ..core.finding import Finding, Severity
 from .cpe import DetectedService, match_cpe, version_gte, version_lt, version_lte
 from .nvd import CVE, NVDClient
+from .seeds import SEED_RULES
 
 # NVD severity string -> our Severity
 _SEV = {
@@ -30,52 +29,6 @@ _SEV = {
     "NONE": Severity.INFO,
     "UNKNOWN": Severity.MEDIUM,
 }
-
-
-@dataclass(frozen=True)
-class SeedRule:
-    """Curated offline fallback for a handful of famous vulnerabilities."""
-
-    product: str
-    affected_below: str            # vulnerable if version < affected_below
-    cve_id: str
-    severity: Severity
-    title: str
-    remediation: str
-    affected_from: str = ""        # inclusive lower bound ("" = no bound)
-
-
-# Small, famous, offline-demo seed set. The NVD mirror is the real database;
-# this only guarantees the engine is useful on a cold cache.
-#
-# Both bounds matter: without affected_from an old release reports a CVE that
-# never applied to it (Apache 2.2.8 "CVE-2021-41773", OpenSSH 4.7p1
-# "CVE-2016-0777") -- a false positive on every legacy box you scan.
-SEED_RULES: list[SeedRule] = [
-    SeedRule("apache http server", "2.4.51", "CVE-2021-41773", Severity.CRITICAL,
-             "Apache path traversal / RCE (2.4.49-2.4.50)",
-             "Upgrade Apache httpd to 2.4.51 or later", affected_from="2.4.49"),
-    SeedRule("apache http server", "2.4.51", "CVE-2021-42013", Severity.CRITICAL,
-             "Apache path traversal / RCE follow-up",
-             "Upgrade Apache httpd to 2.4.51 or later", affected_from="2.4.49"),
-    SeedRule("openssh", "7.4", "CVE-2016-0777", Severity.HIGH,
-             "OpenSSH client info leak / command injection (roaming)",
-             "Upgrade OpenSSH; disable roaming client", affected_from="5.4"),
-    SeedRule("proftpd", "1.3.6", "CVE-2019-12815", Severity.CRITICAL,
-             "ProFTPD mod_copy arbitrary command execution",
-             "Upgrade ProFTPD to 1.3.6 or later / remove mod_copy",
-             affected_from="1.3.5"),
-    SeedRule("vsftpd", "2.3.5", "CVE-2011-2523", Severity.CRITICAL,
-             "vsftpd 2.3.4 backdoor (smiley face)",
-             "Reinstall genuine vsftpd; the backdoored build is not upstream",
-             affected_from="2.3.4"),
-    SeedRule("redis", "6.2.7", "CVE-2022-0543", Severity.CRITICAL,
-             "Redis Lua sandbox escape / RCE (Debian/Ubuntu)",
-             "Upgrade Redis; restrict network exposure", affected_from="4.0"),
-    SeedRule("openssl", "1.0.2k", "CVE-2016-2107", Severity.HIGH,
-             "OpenSSL padding oracle (CVE-2016-2107)",
-             "Upgrade OpenSSL to a patched release", affected_from="1.0.1"),
-]
 
 
 def _seed_matches(detected: DetectedService) -> list[Finding]:

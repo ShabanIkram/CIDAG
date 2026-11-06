@@ -27,6 +27,7 @@ from cidag.reports.exporter import to_csv, to_json, to_markdown, to_sarif
 # Register every bundled scanner.
 import cidag.scanners  # noqa: F401
 from cidag.core.registry import all_scanners, run_scanners
+from cidag.scanners.network.scanner import SCAN_MODES
 
 SCANNER_MODULES = ("s3", "ec2", "net", "policy", "nuclei", "inspector", "sechub", "import")
 ALL_MODULES = ("iam",) + SCANNER_MODULES
@@ -211,6 +212,8 @@ def _scan_inventory(args, inventory: dict, modules: list[str]):
             options={
                 "targets": getattr(args, "targets", None) or [],
                 "ports": _parse_ports(getattr(args, "ports", None)),
+                "scan_mode": getattr(args, "scan_mode", "connect"),
+                "udp_ports": _parse_ports(getattr(args, "udp_ports", None)),
                 "max_hosts": getattr(args, "max_hosts", 1024),
                 "allow_private": bool(getattr(args, "allow_private", False)),
                 "nvd_network": not getattr(args, "no_nvd", False),
@@ -763,6 +766,11 @@ def _add_scan_flags(p):
     p.add_argument("--targets", "-t", action="append", default=[],
                    help="Authorized CIDR for net scan (repeatable). Required for net.")
     p.add_argument("--ports", help="Ports/ranges for net scan, e.g. 22,80,443,8000-9000")
+    p.add_argument("--scan-mode", default="connect", choices=list(SCAN_MODES),
+                   help="net scan mode: connect (TCP banners), service (active "
+                        "protocol probes), udp (UDP probes), all (default: connect)")
+    p.add_argument("--udp-ports",
+                   help="UDP ports/ranges for --scan-mode udp/all (default: common UDP services)")
     p.add_argument("--allow-private", action="store_true",
                    help="Allow scanning private IPs listed in --targets")
     p.add_argument("--max-hosts", type=int, default=1024,

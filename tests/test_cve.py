@@ -1,4 +1,5 @@
 from cidag.core.finding import Severity
+from cidag.cve import SEED_RULES
 from cidag.cve.cpe import DetectedService, match_cpe, parse_version, version_lt, version_lte
 from cidag.cve.engine import _seed_matches, CVEEngine
 from cidag.cve.nvd import CVE
@@ -122,3 +123,48 @@ def test_vsftpd_seed_only_exact_backdoored_version():
     assert cves("2.3.3") == set()
     # old rule used affected_below=3.0.3, reporting every version under 3.0.3
     assert cves("3.0.0") == set()
+
+
+def test_seed_rule_bounds_are_well_formed():
+    """Every seed is a real, actionable rule with a sane version window."""
+    for rule in SEED_RULES:
+        assert rule.title.strip(), rule.cve_id
+        assert rule.remediation.strip(), rule.cve_id
+        assert rule.affected_below, rule.cve_id
+        if rule.affected_from:
+            assert version_lt(rule.affected_from, rule.affected_below), rule.cve_id
+
+
+def test_seed_rule_matches_inside_and_not_at_upper_bound():
+    """A rule fires within its window and never on the fixed release."""
+    def cves(rule, version):
+        return {f.cve for f in _seed_matches(
+            DetectedService(product=rule.product, vendor=rule.product, version=version))}
+
+    for rule in SEED_RULES:
+        assert rule.cve_id in cves(rule, rule.affected_from or "0.0.1"), rule.cve_id
+        assert rule.cve_id not in cves(rule, rule.affected_below), rule.cve_id
+
+
+def test_seed_rule_ids_are_unique_per_product():
+    # Branch-scoped advisories may repeat one CVE, but never with the same window.
+    windows = [(r.product, r.cve_id, r.affected_from, r.affected_below)
+               for r in SEED_RULES]
+    assert len(windows) == len(set(windows))
+    assert len(SEED_RULES) >= 30
+
+
+def test_expanded_seed_coverage_spot_checks():
+    def cves(product, version):
+        return {f.cve for f in _seed_matches(
+            DetectedService(product=product, version=version))}
+
+    assert "CVE-2024-6387" in cves("openssh", "9.7p1")      # regreSSHion
+    assert "CVE-2024-6387" not in cves("openssh", "9.8p1")
+    assert "CVE-2019-5736" in cves("docker", "18.09.1")     # runc escape
+    assert "CVE-2017-7494" in cves("samba", "4.6.4")        # SambaCry
+    # branch-scoped fixes must not be flagged
+    assert "CVE-2017-7494" not in cves("samba", "4.4.14")
+    assert "CVE-2017-7494" not in cves("samba", "4.5.10")
+    assert "CVE-2015-1635" in cves("microsoft iis", "8.5")  # HTTP.sys
+    assert "CVE-2021-44228" not in cves("apache http server", "2.4.48")
