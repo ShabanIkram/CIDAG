@@ -90,5 +90,39 @@
       ]
     }
   ],
+  "guardrails": [
+    {
+      "id": "gcp:orgpolicy:constraints/iam.disableServiceAccountKeyCreation",
+      "name": "constraints/iam.disableServiceAccountKeyCreation",
+      "source": "gcp_org_policy",
+      "principals": ["*"],
+      "statements": [
+        {
+          "Effect": "Deny",
+          "Action": [
+            "iam.serviceAccounts.keys.create",
+            "iam.serviceAccounts.keys.createWithPublicKey",
+            "iam.serviceAccountKeys.create"
+          ],
+          "NotAction": [],
+          "Resource": "*"
+        }
+      ]
+    },
+    {
+      "id": "gcp:orgpolicy:customConstraints/custom.disableServiceAccountCreation",
+      "name": "customConstraints/custom.disableServiceAccountCreation",
+      "source": "gcp_org_policy",
+      "principals": ["*"],
+      "statements": [
+        {
+          "Effect": "Deny",
+          "Action": ["iam.serviceAccounts.create"],
+          "NotAction": [],
+          "Resource": "*"
+        }
+      ]
+    }
+  ],
   "resources": []
 }

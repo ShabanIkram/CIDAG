@@ -29,6 +29,11 @@ offline-first tool with a unified report.
 - **Azure / GCP collectors** — Azure RBAC role assignments and GCP project IAM
   bindings normalize into the same attack graph and policy engine (read-only;
   optional SDK extras)
+- **Azure deny assignments / GCP organization policies** — deny assignments
+  (including principal exclusions and `NotActions` carve-outs) and enforced
+  organization policy constraints are collected read-only and evaluated as
+  deny-only, principal-scoped guardrails, so blocked actions never surface as
+  escalation findings, wildcard admin, or PassRole edges
 - **IAM policy risk analysis** — Cloudsplaining-style least-privilege lens:
   wildcard-admin policies, privilege-escalation primitives, data-exfiltration
   capability, public trust principals (POL-001…POL-004)
@@ -360,7 +365,7 @@ All tests run offline against bundled mocks — no cloud credentials or network 
       rollback, audit manifest, and matching detection content
 - [x] Azure / GCP authorized execution parity (AZ-01 Owner grant, GCP-01 roles/owner)
 - [x] Multi-step chain execution (ordered chains, all-or-nothing reverse rollback)
-- [ ] Azure deny assignments / GCP organization policy constraints
+- [x] Azure deny assignments / GCP organization policy constraints
 - [ ] UDP and service-detection scan modes
 - [ ] Expanded offline CVE seed coverage (beyond classic backdoored builds)
 

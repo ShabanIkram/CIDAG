@@ -48,6 +48,22 @@ class Statement:
         return False
 
 
+def guardrail_denies(stmt: Statement, action: str) -> bool:
+    """Does a cloud guardrail statement deny ``action``?
+
+    Guardrails (Azure deny assignments, GCP organization policy constraints)
+    are deny-only: they never grant. Unlike :meth:`Statement.matches_action`
+    -- whose ``NotAction`` branch only applies to NotAction-only statements --
+    a guardrail honours ``NotAction`` as an exclusion from ``Action``, which is
+    how Azure's ``Permissions.NotActions`` carve-out works.
+    """
+    if str(stmt.effect).lower() != "deny":
+        return False
+    if not any(action_matches(p, action) for p in stmt.actions):
+        return False
+    return not any(action_matches(p, action) for p in stmt.not_actions)
+
+
 @dataclass
 class EffectivePermissions:
     arn: str
@@ -59,9 +75,17 @@ class EffectivePermissions:
     boundary: list[Statement] | None = None
     # Account-level service control policies (None/empty = no SCP restrictions).
     scps: list[Statement] = field(default_factory=list)
+    # Cloud guardrails: Azure deny assignments and GCP organization policy
+    # constraints. Deny-only and principal-scoped; they can only remove
+    # permissions, never grant them.
+    guardrails: list[Statement] = field(default_factory=list)
 
     def denied(self, action: str) -> bool:
         return any(s.matches_action(action) for s in self.deny)
+
+    def guardrail_allows(self, action: str) -> bool:
+        """Cloud guardrail: a matching deny blocks the action outright."""
+        return not any(guardrail_denies(s, action) for s in self.guardrails)
 
     def boundary_allows(self, action: str) -> bool:
         """AWS boundary semantics: the boundary itself must grant the action."""
@@ -88,6 +112,8 @@ class EffectivePermissions:
     def allowed(self, action: str) -> bool:
         if self.denied(action):
             return False
+        if not self.guardrail_allows(action):
+            return False
         if not self.boundary_allows(action):
             return False
         if not self.scp_allows(action):
@@ -96,6 +122,8 @@ class EffectivePermissions:
 
     def is_admin(self) -> bool:
         if self.denied("*"):
+            return False
+        if not self.guardrail_allows("*"):
             return False
         if not self.boundary_allows("*"):
             return False
@@ -118,8 +146,10 @@ class EffectivePermissions:
             for p in s.actions:
                 if self.denied(p):
                     continue
-                if not self.boundary_allows(p) or not self.scp_allows(p):
-                    # Constrained by a boundary/SCP: not effective admin.
+                if (not self.boundary_allows(p) or not self.scp_allows(p)
+                        or not self.guardrail_allows(p)):
+                    # Constrained by a boundary/SCP/cloud guardrail: the
+                    # wildcard is not actually effective admin.
                     continue
                 if p == "*":
                     findings.append({
@@ -148,15 +178,43 @@ def _statements(statements) -> list[Statement]:
     return [Statement.from_dict(s) for s in statements or [] if isinstance(s, dict)]
 
 
+def _guardrails_for(guardrails, ident_arn: str) -> list[Statement]:
+    """The cloud guardrail statements that apply to one identity.
+
+    A guardrail entry carries ``principals`` (identity ARNs, ``*`` allowed) and
+    ``exclude_principals`` (Azure deny-assignment exceptions). A missing
+    ``principals`` key means "applies to every identity" -- that is how GCP
+    organization policy constraints, which bind resources rather than
+    principals, are represented.
+    """
+    selected: list[Statement] = []
+    for g in guardrails or []:
+        if not isinstance(g, dict):
+            continue
+        if ident_arn in {str(p) for p in (g.get("exclude_principals") or [])}:
+            continue
+        principals = g.get("principals")
+        if principals is not None and not any(
+            str(p) == "*" or str(p) == ident_arn
+            or action_matches(str(p), ident_arn)
+            for p in principals
+        ):
+            continue
+        selected.extend(_statements(g.get("statements")))
+    return selected
+
+
 def compute_effective(inventory: dict) -> dict[str, EffectivePermissions]:
     policies_by_arn = {p["arn"]: p for p in inventory.get("policies", [])}
     scp_stmts = [stmt for scp in inventory.get("scps", []) or []
                  for stmt in _statements(scp.get("statements"))]
+    guardrails = inventory.get("guardrails") or []
     result: dict[str, EffectivePermissions] = {}
 
     for ident in inventory.get("identities", []):
         ep = EffectivePermissions(arn=ident["arn"], label=ident["name"], kind=ident["type"],
-                                  scps=scp_stmts)
+                                  scps=scp_stmts,
+                                  guardrails=_guardrails_for(guardrails, ident["arn"]))
         policy_arns = ident.get("attached_policies", []) + ident.get("inline_policies", [])
         for p_arn in policy_arns:
             policy = policies_by_arn.get(p_arn)

@@ -7,7 +7,9 @@ with ``attached_policies`` pointing at those roles. The existing graph, policy
 analysis, and reports then work unchanged.
 
 Read-only access required: ``Reader`` at subscription scope (or
-``Microsoft.Authorization/*/read``). Install with ``pip install "cidag[azure]"``.
+``Microsoft.Authorization/*/read``). Deny assignments -- Azure's cloud
+guardrails -- additionally need ``Microsoft.Authorization/denyAssignments/read``
+and degrade to a warning when missing. Install with ``pip install "cidag[azure]"``.
 """
 from __future__ import annotations
 
@@ -50,10 +52,46 @@ def _statements_of(role_def) -> list[dict]:
     return statements
 
 
-def normalize(subscription_id: str, role_defs, assignments) -> dict:
+def _deny_statements(deny_assignment) -> list[dict]:
+    """Azure deny-assignment permissions -> Deny statements.
+
+    ``Actions``/``NotActions`` are control plane and ``DataActions``/
+    ``NotDataActions`` data plane; the two namespaces do not overlap, so they
+    collapse into one Action/NotAction pair. ``NotActions`` is preserved as the
+    carve-out the evaluator subtracts from the deny.
+    """
+    statements: list[dict] = []
+    for perm in _g(deny_assignment, "permissions", []) or []:
+        actions = sorted({str(a) for a in (_g(perm, "actions", []) or [])
+                          + (_g(perm, "data_actions", []) or []) if a})
+        if not actions:
+            continue
+        not_actions = sorted({str(a) for a in (_g(perm, "not_actions", []) or [])
+                              + (_g(perm, "not_data_actions", []) or []) if a})
+        statements.append({"Effect": "Deny", "Action": actions,
+                           "NotAction": not_actions, "Resource": "*"})
+    return statements
+
+
+def _principal_arns(deny_assignment, subscription_id: str, key: str) -> list[str]:
+    arns = []
+    for principal in _g(deny_assignment, key, []) or []:
+        if isinstance(principal, str):
+            object_id = principal
+        else:
+            object_id = _g(principal, "object_id") or _g(principal, "id")
+        if object_id:
+            arns.append(f"azure:{subscription_id}:principal:{object_id}")
+    return arns
+
+
+def normalize(subscription_id: str, role_defs, assignments,
+              deny_assignments=None) -> dict:
     """Build a CIDAG inventory from Azure role definitions + assignments.
 
     Accepts azure-mgmt-authorization SDK models or equivalent dicts.
+    ``deny_assignments`` (optional) become cloud guardrails: deny-only
+    statements scoped to the principals they name.
     """
     policies: dict[str, dict] = {}
     for rd in role_defs:
@@ -85,12 +123,30 @@ def normalize(subscription_id: str, role_defs, assignments) -> dict:
         if role_id not in identity["attached_policies"]:
             identity["attached_policies"].append(role_id)
 
+    guardrails: list[dict] = []
+    for da in deny_assignments or []:
+        statements = _deny_statements(da)
+        if not statements:
+            continue
+        guardrails.append({
+            "id": str(_g(da, "id") or _g(da, "deny_assignment_id") or "deny-assignment"),
+            "name": str(_g(da, "display_name") or _g(da, "description")
+                        or "deny assignment"),
+            "source": "azure_deny_assignment",
+            "scope": str(_g(da, "scope") or ""),
+            "principals": _principal_arns(da, subscription_id, "principals"),
+            "exclude_principals": _principal_arns(
+                da, subscription_id, "exclude_principals"),
+            "statements": statements,
+        })
+
     return {
         "cloud": "azure",
         "account_id": subscription_id,
         "identities": list(principals.values()),
         "policies": list(policies.values()),
         "resources": [],
+        "guardrails": guardrails,
     }
 
 
@@ -132,6 +188,21 @@ class AzureCollector(BaseCollector):
             raise AzureCollectionError(
                 f"Azure RBAC collection failed for {subscription_id}: {e}") from e
 
-        inventory = normalize(subscription_id, role_defs, assignments)
+        inventory = normalize(subscription_id, role_defs, assignments,
+                              self._collect_deny_assignments(client))
         inventory["region"] = self.region
         return inventory
+
+    def _collect_deny_assignments(self, client) -> list[dict]:
+        """Collect deny assignments (``Microsoft.Authorization/denyAssignments/read``).
+
+        Best-effort like ``_collect_scps``: a principal without that permission
+        still gets a full RBAC scan, so a failure degrades to "no Azure
+        guardrails" with a warning instead of aborting the collection.
+        """
+        try:
+            return list(client.deny_assignments.list_for_subscription())
+        except Exception as e:
+            print(f"[!] deny assignments: unavailable ({e}); "
+                  "Azure guardrail evaluation skipped")
+            return []

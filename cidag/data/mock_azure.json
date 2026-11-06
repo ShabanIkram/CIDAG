@@ -114,5 +114,28 @@
       ]
     }
   ],
+  "guardrails": [
+    {
+      "id": "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f/providers/Microsoft.Authorization/denyAssignments/2f8e9d7c-block-role-writes",
+      "name": "Block role assignment writes for platform admins",
+      "source": "azure_deny_assignment",
+      "scope": "/subscriptions/9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f",
+      "principals": [
+        "azure:9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f:principal:c4d5e6f7-admins"
+      ],
+      "exclude_principals": [],
+      "statements": [
+        {
+          "Effect": "Deny",
+          "Action": [
+            "Microsoft.Authorization/roleAssignments/write",
+            "Microsoft.Authorization/roleDefinitions/write"
+          ],
+          "NotAction": [],
+          "Resource": "*"
+        }
+      ]
+    }
+  ],
   "resources": []
 }
